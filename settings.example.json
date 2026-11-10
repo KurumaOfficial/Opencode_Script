@@ -1,0 +1,8 @@
+{
+  "message": "Продолжай разработку",
+  "autoAdd": true,
+  "chats": [
+    { "id": "ses_xxxxxxxxxxxxxxxxxxxxxxxx", "title": "Название чата" }
+  ],
+  "ignored": []
+}

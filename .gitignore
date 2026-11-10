@@ -1,0 +1,9 @@
+# личные данные и артефакты сборки
+settings.json
+auto-continue.log
+dist/
+*.exe
+
+# системный мусор
+Thumbs.db
+desktop.ini
