@@ -116,12 +116,11 @@ powershell -ExecutionPolicy Bypass -File AutoContinue.ps1
 
 ```mermaid
 flowchart LR
-    A["🖥 Окно<br/>настройки · статусы · стоп"] --> B["⚙️ Наблюдатель"]
-    B -- "GET /api/session/active" --> C[("OpenCode<br/>Service")]
-    B -- "GET /api/session/{id}" --> C
-    B -- "POST /api/session/{id}/prompt" --> C
-    C -- "idle / running" --> B
-    B -- "лог · счётчики" --> A
+    A["🖥 Окно"] --> B["⚙️ Наблюдатель"]
+    B -->|"кто работает?"| C[("☁️ OpenCode")]
+    B -->|"продолжай"| C
+    C -->|"ответ готов"| B
+    B -->|"статус и лог"| A
 ```
 
 Ключевые запросы:
