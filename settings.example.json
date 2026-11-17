@@ -1,6 +1,7 @@
 {
+  "schema": 2,
   "message": "Продолжай разработку",
-  "autoAdd": true,
+  "autoAdd": false,
   "chats": [
     { "id": "ses_xxxxxxxxxxxxxxxxxxxxxxxx", "title": "Название чата" }
   ],

@@ -6,9 +6,9 @@
     автоматически отправляет ему заданный текст ("Продолжай разработку").
 
     - Список чатов живёт по sessionId, поэтому переименование чата ничего не ломает.
-    - Новые активные чаты подхватываются автоматически (можно выключить).
+    - Новые активные чаты можно подхватывать автоматически (в настройках, по умолчанию выкл).
     - Текст сообщения и список чатов настраиваются прямо в окне и сохраняются
-      в settings.json рядом со скриптом.
+      в settings.json (у .exe — в %APPDATA%\OpenCodeAutoContinue).
     - Лимит запуска: по количеству итераций или до заданного времени.
     - Ошибки не заливают журнал: повторы с паузой, авто-стоп и переподключение.
 
@@ -22,7 +22,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.3.0'
+$script:AppVersion = '1.4.0'
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -177,23 +177,27 @@ function Invoke-OcApi {
 
 $settings = @{
     message    = $MessageText
-    autoAdd    = $true
+    autoAdd    = $false
     chats      = @()
     ignored    = @()
     limitMode  = 'none'
     limitCount = 50
     limitTime  = '18:00'
     topmost    = $true
-    winWidth   = 860
-    winHeight  = 880
+    winWidth   = 400
+    winHeight  = 520
 }
 
 if (Test-Path -LiteralPath $script:SettingsPath) {
     try {
         $rawText = [IO.File]::ReadAllText($script:SettingsPath, [Text.Encoding]::UTF8)
         $raw = $rawText | ConvertFrom-Json
-        if ($raw.message) { $settings.message = [string]$raw.message }
-        if ($null -ne $raw.autoAdd) { $settings.autoAdd = [bool]$raw.autoAdd }
+        $schema = 0
+        if ($null -ne $raw.schema) { [void][int]::TryParse([string]$raw.schema, [ref]$schema) }
+        if ($null -ne $raw.message) { $settings.message = [string]$raw.message }
+        # до схемы 2 автодобавление включалось по умолчанию, а не выбором пользователя —
+        # новый интерфейс стартует с выключенным
+        if ($schema -ge 2 -and $null -ne $raw.autoAdd) { $settings.autoAdd = [bool]$raw.autoAdd }
         if ($raw.chats) {
             $settings.chats = @($raw.chats | ForEach-Object {
                     @{ Id = [string]$_.id; Title = [string]$_.title }
@@ -213,8 +217,9 @@ if (Test-Path -LiteralPath $script:SettingsPath) {
             }
         }
         if ($null -ne $raw.topmost) { $settings.topmost = [bool]$raw.topmost }
-        if ($null -ne $raw.winWidth) { $settings.winWidth = [int]$raw.winWidth }
-        if ($null -ne $raw.winHeight) { $settings.winHeight = [int]$raw.winHeight }
+        # размеры окна старого интерфейса (860x880) в новый не переносим
+        if ($schema -ge 2 -and $null -ne $raw.winWidth) { $settings.winWidth = [int]$raw.winWidth }
+        if ($schema -ge 2 -and $null -ne $raw.winHeight) { $settings.winHeight = [int]$raw.winHeight }
     }
     catch { }
 }
@@ -227,6 +232,7 @@ $script:Dirty = $false
 function Save-Settings {
     try {
         $payload = @{
+            schema     = 2
             message    = [string]$state.Message
             autoAdd    = [bool]$state.AutoAdd
             chats      = @($state.Chats | ForEach-Object { @{ id = [string]$_.Id; title = [string]$_.Title } })
@@ -311,7 +317,7 @@ function API {
     $req.Headers['Authorization'] = 'Basic ' + $state.Auth
     $req.Timeout = $Timeout
     $req.ReadWriteTimeout = $Timeout
-    $req.UserAgent = 'OpenCode-AutoContinue/1.3'
+    $req.UserAgent = 'OpenCode-AutoContinue/1.4'
     $req.KeepAlive = $false
 
     if ($null -ne $Body) {
@@ -472,7 +478,6 @@ function Send-Chat($chat) {
         $chat.FailStreak = 0
         $chat.LastError = ''
         $chat.NextTryAt = [datetime]::MinValue
-        $chat.NoAnswer = 0
         Log 'info' ('[' + (Chat-Name $chat) + '] → ' + $state.Message + '  (#' + $chat.Count + ')')
     }
     catch {
@@ -527,6 +532,7 @@ $lastApiErr = ''
 $healthOk = 0
 $nextHealth = [datetime]::MinValue
 $infoCache = @{}
+$infoRetry = @{}
 $lastResolve = [datetime]::MinValue
 
 Log 'info' ('Сервер: ' + $state.BaseUrl + $(if ($state.ServiceVersion) { ' · OpenCode ' + $state.ServiceVersion } else { '' }))
@@ -650,8 +656,16 @@ while ($true) {
                 if ($state.Ignored.ContainsKey($id)) { continue }
 
                 if (-not $infoCache.ContainsKey($id)) {
-                    try { $infoCache[$id] = (API 'GET' ("/api/session/" + $id)).data }
-                    catch { $infoCache[$id] = $null }
+                    # разовая ошибка запроса не должна навсегда выкинуть чат из автодобавления
+                    if ($infoRetry.ContainsKey($id) -and (Get-Date) -lt $infoRetry[$id]) { continue }
+                    try {
+                        $infoCache[$id] = (API 'GET' ("/api/session/" + $id)).data
+                        $infoRetry.Remove($id)
+                    }
+                    catch {
+                        $infoRetry[$id] = (Get-Date).AddSeconds(15)
+                        continue
+                    }
                 }
                 $info = $infoCache[$id]
                 if ($null -eq $info) { continue }
@@ -660,7 +674,7 @@ while ($true) {
 
                 Add-Chat $id ([string]$info.title) 'активный чат'
             }
-            if ($infoCache.Count -gt 400) { $infoCache = @{} }
+            if ($infoCache.Count -gt 400) { $infoCache = @{}; $infoRetry = @{} }
         }
 
         foreach ($chat in $chats.ToArray()) {
@@ -675,6 +689,7 @@ while ($true) {
                 if ($busy) {
                     $chat.Phase = 'running'
                     $chat.Status = 'печатает…'
+                    $chat.NoAnswer = 0
                 }
                 elseif (-not $chat.NextTryAt -or (Get-Date) -ge [datetime]$chat.NextTryAt) {
                     Send-Chat $chat
@@ -684,6 +699,7 @@ while ($true) {
                 if ($busy) {
                     $chat.Phase = 'running'
                     $chat.Status = 'печатает…'
+                    $chat.NoAnswer = 0
                 }
                 else {
                     $age = ((Get-Date) - [datetime]$chat.SentAt).TotalSeconds
@@ -744,17 +760,18 @@ $worker.Runspace = $runspace
 $workerHandle = $worker.BeginInvoke()
 
 # --------------------------------------------------------------------- ui ----
+# Стиль — палитра OpenCode: #0a0a0a / #141414 / #1e1e1e, акцент #fab283, моно-шрифт.
 
 $uiXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="OpenCode AutoContinue"
-        Width="860" Height="880" MinWidth="720" MinHeight="680"
+        Width="400" Height="520" MinWidth="360" MinHeight="440"
         WindowStyle="None" ResizeMode="CanResize"
         WindowStartupLocation="CenterScreen"
-        Background="#0A0E15" Foreground="#ECF1F8"
-        FontFamily="Segoe UI Variable Text, Segoe UI"
+        Background="#0A0A0A" Foreground="#EEEEEE"
+        FontFamily="Cascadia Mono, Consolas" FontSize="12"
         TextOptions.TextFormattingMode="Display"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <shell:WindowChrome.WindowChrome>
@@ -763,15 +780,11 @@ $uiXaml = @'
                         UseAeroCaptionButtons="False"/>
   </shell:WindowChrome.WindowChrome>
   <Window.Resources>
-    <SolidColorBrush x:Key="TextMain" Color="#ECF1F8"/>
-    <SolidColorBrush x:Key="TextMuted" Color="#8B99AE"/>
-    <SolidColorBrush x:Key="TextDim" Color="#6B7A90"/>
-    <SolidColorBrush x:Key="Accent" Color="#34D399"/>
-    <SolidColorBrush x:Key="AccentSoft" Color="#6EE7B7"/>
-    <SolidColorBrush x:Key="Danger" Color="#F87171"/>
-    <SolidColorBrush x:Key="Warn" Color="#FBBF24"/>
-    <SolidColorBrush x:Key="Blue" Color="#60A5FA"/>
-    <SolidColorBrush x:Key="FieldBorder" Color="#223047"/>
+    <SolidColorBrush x:Key="TextMain" Color="#EEEEEE"/>
+    <SolidColorBrush x:Key="TextMuted" Color="#808080"/>
+    <SolidColorBrush x:Key="TextDim" Color="#606060"/>
+    <SolidColorBrush x:Key="Primary" Color="#FAB283"/>
+    <SolidColorBrush x:Key="FieldBorder" Color="#282828"/>
 
     <Style x:Key="SectionLabel" TargetType="TextBlock">
       <Setter Property="FontSize" Value="10"/>
@@ -779,29 +792,21 @@ $uiXaml = @'
       <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
     </Style>
 
-    <Style x:Key="Card" TargetType="Border">
-      <Setter Property="Background" Value="#101722"/>
-      <Setter Property="BorderBrush" Value="#1C2838"/>
-      <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="CornerRadius" Value="14"/>
-      <Setter Property="Padding" Value="16,14"/>
-    </Style>
-
     <Style x:Key="PrimaryButton" TargetType="Button">
-      <Setter Property="Height" Value="44"/>
+      <Setter Property="Height" Value="48"/>
       <Setter Property="Padding" Value="18,0"/>
-      <Setter Property="Background" Value="{StaticResource Accent}"/>
-      <Setter Property="Foreground" Value="#05170E"/>
+      <Setter Property="Background" Value="#E06C75"/>
+      <Setter Property="Foreground" Value="#0A0A0A"/>
       <Setter Property="FontSize" Value="13"/>
-      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="FontWeight" Value="Bold"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
             <Grid>
-              <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="11"/>
-              <Border x:Name="Hover" Background="#18FFFFFF" CornerRadius="11" Opacity="0"/>
+              <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="6"/>
+              <Border x:Name="Hover" Background="#1FFFFFFF" CornerRadius="6" Opacity="0"/>
               <ContentPresenter Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Grid>
             <ControlTemplate.Triggers>
@@ -810,7 +815,7 @@ $uiXaml = @'
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
                 <Setter TargetName="Hover" Property="Opacity" Value="1"/>
-                <Setter TargetName="Bd" Property="Opacity" Value="0.82"/>
+                <Setter TargetName="Bd" Property="Opacity" Value="0.8"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
                 <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
@@ -822,28 +827,29 @@ $uiXaml = @'
     </Style>
 
     <Style x:Key="GhostButton" TargetType="Button">
-      <Setter Property="Height" Value="28"/>
-      <Setter Property="Padding" Value="11,0"/>
-      <Setter Property="Background" Value="#111927"/>
-      <Setter Property="Foreground" Value="#A9B6C8"/>
-      <Setter Property="BorderBrush" Value="#223047"/>
+      <Setter Property="Height" Value="26"/>
+      <Setter Property="Padding" Value="10,0"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="#A0A0A0"/>
+      <Setter Property="BorderBrush" Value="#3C3C3C"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="FontSize" Value="11"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
             <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#172234"/>
-                <Setter Property="Foreground" Value="#E8EEF7"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#484848"/>
+                <Setter Property="Foreground" Value="#EEEEEE"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#1E2C42"/>
+                <Setter TargetName="Bd" Property="Background" Value="#282828"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
                 <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
@@ -856,21 +862,21 @@ $uiXaml = @'
 
     <Style x:Key="LinkButton" TargetType="Button">
       <Setter Property="Background" Value="Transparent"/>
-      <Setter Property="Foreground" Value="#7E8CA3"/>
-      <Setter Property="FontSize" Value="11"/>
-      <Setter Property="Padding" Value="7,3"/>
+      <Setter Property="Foreground" Value="#808080"/>
+      <Setter Property="FontSize" Value="10.5"/>
+      <Setter Property="Padding" Value="6,3"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#131C29"/>
-                <Setter Property="Foreground" Value="#C8D4E4"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
+                <Setter Property="Foreground" Value="#EEEEEE"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -879,27 +885,27 @@ $uiXaml = @'
     </Style>
 
     <Style x:Key="IconButton" TargetType="Button">
-      <Setter Property="Width" Value="30"/>
+      <Setter Property="Width" Value="34"/>
       <Setter Property="Height" Value="28"/>
       <Setter Property="Background" Value="Transparent"/>
-      <Setter Property="Foreground" Value="#78879D"/>
+      <Setter Property="Foreground" Value="#808080"/>
       <Setter Property="FontFamily" Value="Segoe Fluent Icons, Segoe MDL2 Assets"/>
-      <Setter Property="FontSize" Value="10.5"/>
+      <Setter Property="FontSize" Value="11"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="7">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="5">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#172131"/>
-                <Setter Property="Foreground" Value="#E8EEF7"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
+                <Setter Property="Foreground" Value="#EEEEEE"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#212D40"/>
+                <Setter TargetName="Bd" Property="Background" Value="#282828"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -911,16 +917,16 @@ $uiXaml = @'
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="7">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="5">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#B91C1C"/>
-                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="#E06C75"/>
+                <Setter Property="Foreground" Value="#0A0A0A"/>
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#991B1B"/>
+                <Setter TargetName="Bd" Property="Background" Value="#B8555D"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -929,25 +935,25 @@ $uiXaml = @'
     </Style>
 
     <Style x:Key="SegmentRadio" TargetType="RadioButton">
-      <Setter Property="Height" Value="30"/>
-      <Setter Property="Foreground" Value="#8B99AE"/>
+      <Setter Property="Height" Value="26"/>
+      <Setter Property="Foreground" Value="#808080"/>
       <Setter Property="FontSize" Value="10.5"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="RadioButton">
-            <Border x:Name="Bd" Background="#0D141E" BorderBrush="#1C2838" BorderThickness="1" CornerRadius="7">
+            <Border x:Name="Bd" Background="Transparent" BorderBrush="#282828" BorderThickness="1" CornerRadius="5">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#2C3C55"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#3C3C3C"/>
               </Trigger>
               <Trigger Property="IsChecked" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#12291F"/>
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#2E6A4F"/>
-                <Setter Property="Foreground" Value="#6EE7B7"/>
-                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#FAB283"/>
+                <Setter Property="Foreground" Value="#FAB283"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -956,29 +962,33 @@ $uiXaml = @'
     </Style>
 
     <Style x:Key="Switch" TargetType="CheckBox">
-      <Setter Property="Foreground" Value="#DCE6F3"/>
-      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="Foreground" Value="#EEEEEE"/>
+      <Setter Property="HorizontalAlignment" Value="Stretch"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="CheckBox">
-            <StackPanel Orientation="Horizontal" Background="Transparent">
-              <Border x:Name="Track" Width="36" Height="20" CornerRadius="10" Background="#182233"
-                      BorderBrush="#2A3A50" BorderThickness="1" VerticalAlignment="Center">
-                <Ellipse x:Name="Knob" Width="14" Height="14" Fill="#7A8798" HorizontalAlignment="Left" Margin="2,0,0,0"/>
+            <Grid Background="Transparent">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <ContentPresenter VerticalAlignment="Center"/>
+              <Border x:Name="Track" Grid.Column="1" Width="34" Height="18" CornerRadius="9" Background="#1E1E1E"
+                      BorderBrush="#3C3C3C" BorderThickness="1" VerticalAlignment="Center" Margin="12,0,0,0">
+                <Ellipse x:Name="Knob" Width="12" Height="12" Fill="#808080" HorizontalAlignment="Left" Margin="2,0,0,0"/>
               </Border>
-              <ContentPresenter Margin="10,0,0,0" VerticalAlignment="Center"/>
-            </StackPanel>
+            </Grid>
             <ControlTemplate.Triggers>
               <Trigger Property="IsChecked" Value="True">
-                <Setter TargetName="Track" Property="Background" Value="#123626"/>
-                <Setter TargetName="Track" Property="BorderBrush" Value="#2F7A51"/>
-                <Setter TargetName="Knob" Property="Fill" Value="#34D399"/>
+                <Setter TargetName="Track" Property="Background" Value="#2E2118"/>
+                <Setter TargetName="Track" Property="BorderBrush" Value="#FAB283"/>
+                <Setter TargetName="Knob" Property="Fill" Value="#FAB283"/>
                 <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right"/>
                 <Setter TargetName="Knob" Property="Margin" Value="0,0,2,0"/>
               </Trigger>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Track" Property="BorderBrush" Value="#3A506C"/>
+                <Setter TargetName="Track" Property="BorderBrush" Value="#606060"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -987,27 +997,29 @@ $uiXaml = @'
     </Style>
 
     <Style TargetType="TextBox">
-      <Setter Property="Background" Value="#0A1019"/>
+      <Setter Property="Background" Value="#141414"/>
       <Setter Property="Foreground" Value="{StaticResource TextMain}"/>
-      <Setter Property="CaretBrush" Value="{StaticResource AccentSoft}"/>
-      <Setter Property="SelectionBrush" Value="#2563EB"/>
+      <Setter Property="CaretBrush" Value="{StaticResource Primary}"/>
+      <Setter Property="SelectionBrush" Value="#FAB283"/>
       <Setter Property="BorderBrush" Value="{StaticResource FieldBorder}"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="Padding" Value="10,7"/>
-      <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="Padding" Value="10,8"/>
+      <Setter Property="FontSize" Value="12"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="TextBox">
             <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="9">
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6">
               <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"
                             VerticalScrollBarVisibility="{TemplateBinding VerticalScrollBarVisibility}"
                             HorizontalScrollBarVisibility="{TemplateBinding HorizontalScrollBarVisibility}"/>
             </Border>
             <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#3C3C3C"/>
+              </Trigger>
               <Trigger Property="IsKeyboardFocused" Value="True">
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#3F6E5C"/>
-                <Setter TargetName="Bd" Property="Background" Value="#0C1420"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#FAB283"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -1031,7 +1043,7 @@ $uiXaml = @'
                   <Thumb>
                     <Thumb.Template>
                       <ControlTemplate TargetType="Thumb">
-                        <Border Background="#2A374B" CornerRadius="3" Margin="1,2"/>
+                        <Border Background="#3C3C3C" CornerRadius="3" Margin="1,2"/>
                       </ControlTemplate>
                     </Thumb.Template>
                   </Thumb>
@@ -1048,17 +1060,17 @@ $uiXaml = @'
     <Style TargetType="ScrollBar" BasedOn="{StaticResource SlimScrollBar}"/>
 
     <Style TargetType="ToolTip">
-      <Setter Property="Background" Value="#141D2B"/>
-      <Setter Property="Foreground" Value="#D7E2F0"/>
-      <Setter Property="BorderBrush" Value="#273449"/>
+      <Setter Property="Background" Value="#1E1E1E"/>
+      <Setter Property="Foreground" Value="#EEEEEE"/>
+      <Setter Property="BorderBrush" Value="#3C3C3C"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="FontSize" Value="11"/>
-      <Setter Property="Padding" Value="8,5"/>
+      <Setter Property="FontSize" Value="10.5"/>
+      <Setter Property="Padding" Value="7,4"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ToolTip">
             <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7" Padding="{TemplateBinding Padding}">
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}">
               <ContentPresenter/>
             </Border>
           </ControlTemplate>
@@ -1067,15 +1079,15 @@ $uiXaml = @'
     </Style>
 
     <Style TargetType="ProgressBar">
-      <Setter Property="Background" Value="#1A2434"/>
-      <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+      <Setter Property="Background" Value="#282828"/>
+      <Setter Property="Foreground" Value="{StaticResource Primary}"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ProgressBar">
-            <Border Background="{TemplateBinding Background}" CornerRadius="2" ClipToBounds="True">
+            <Border Background="{TemplateBinding Background}" CornerRadius="1.5" ClipToBounds="True">
               <Grid x:Name="PART_Track">
-                <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Background="{TemplateBinding Foreground}" CornerRadius="2"/>
+                <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Background="{TemplateBinding Foreground}" CornerRadius="1.5"/>
               </Grid>
             </Border>
           </ControlTemplate>
@@ -1084,46 +1096,133 @@ $uiXaml = @'
     </Style>
   </Window.Resources>
 
-  <Border x:Name="WindowFrame" Background="#0A0E15" BorderBrush="#1B2634" BorderThickness="1">
+  <Border x:Name="WindowFrame" Background="#0A0A0A" BorderBrush="#282828" BorderThickness="1">
     <Grid>
       <Grid.RowDefinitions>
-        <RowDefinition Height="46"/>
+        <RowDefinition Height="36"/>
         <RowDefinition Height="*"/>
       </Grid.RowDefinitions>
 
       <!-- ===== title bar ===== -->
-      <Border Grid.Row="0" BorderBrush="#141D2A" BorderThickness="0,0,0,1" Background="#0A0E15">
-        <Grid>
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-          </Grid.ColumnDefinitions>
-          <Grid x:Name="DragArea" Background="Transparent">
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
-              <Image x:Name="TitleIcon" Width="20" Height="20" Margin="0,0,10,0"
-                     RenderOptions.BitmapScalingMode="HighQuality"/>
-              <TextBlock Text="AutoContinue" FontSize="12.5" FontWeight="SemiBold"
-                         Foreground="#E8EEF7" VerticalAlignment="Center"/>
-              <Border Background="#111926" BorderBrush="#1E2A3B" BorderThickness="1"
-                      CornerRadius="5" Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center">
-                <TextBlock Text="OPENCODE" FontSize="8" FontWeight="Bold" Foreground="#73839A"/>
-              </Border>
-            </StackPanel>
-          </Grid>
-          <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
-            <Button x:Name="PinBtn" Style="{StaticResource IconButton}" Content="&#xE718;" ToolTip="Поверх всех окон"/>
-            <Button x:Name="MinBtn" Style="{StaticResource IconButton}" Content="&#xE921;" ToolTip="Свернуть"/>
-            <Button x:Name="MaxBtn" Style="{StaticResource IconButton}" Content="&#xE922;" ToolTip="Развернуть"/>
-            <Button x:Name="CloseBtn" Style="{StaticResource CloseButton}" Content="&#xE8BB;" ToolTip="Выход"/>
+      <Grid Grid.Row="0" Background="#0A0A0A">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <Grid x:Name="DragArea" Background="Transparent" ClipToBounds="True">
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+            <Image x:Name="TitleIcon" Width="18" Height="18" Margin="0,0,10,0"
+                   RenderOptions.BitmapScalingMode="HighQuality"/>
+            <Ellipse x:Name="StatusDot" Width="7" Height="7" Fill="#7FD88F" VerticalAlignment="Center"/>
+            <TextBlock x:Name="StatusText" Text="РАБОТАЕТ" Margin="7,0,0,0" FontSize="10.5"
+                       FontWeight="Bold" Foreground="#7FD88F" VerticalAlignment="Center"/>
+            <TextBlock x:Name="StatusMeta" Text="" Margin="8,0,0,0" FontSize="10"
+                       Foreground="#606060" VerticalAlignment="Center"/>
           </StackPanel>
         </Grid>
-      </Border>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,6,0">
+          <Button x:Name="SettingsBtn" Style="{StaticResource IconButton}" Content="&#xE713;" ToolTip="Настройки и журнал"/>
+          <Button x:Name="MinBtn" Style="{StaticResource IconButton}" Content="&#xE921;" ToolTip="Свернуть"/>
+          <Button x:Name="CloseBtn" Style="{StaticResource CloseButton}" Content="&#xE8BB;" ToolTip="Выход"/>
+        </StackPanel>
+      </Grid>
 
-      <!-- ===== body ===== -->
-      <Grid Grid.Row="1" Margin="20,14,20,12">
+      <!-- ===== main view ===== -->
+      <Grid x:Name="MainView" Grid.Row="1" Margin="14,4,14,14">
         <Grid.RowDefinitions>
+          <RowDefinition Height="*" MinHeight="80"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- message -->
+        <Grid Grid.Row="0">
+          <TextBox x:Name="MessageBox" AcceptsReturn="True" TextWrapping="Wrap" MaxLength="4000"
+                   VerticalContentAlignment="Top" Padding="12,10"
+                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"/>
+          <TextBlock x:Name="MessageHint" Text="Что отправлять боту после каждого ответа…"
+                     Margin="13,11,13,0" Foreground="#606060" IsHitTestVisible="False"
+                     TextWrapping="Wrap" VerticalAlignment="Top"/>
+        </Grid>
+
+        <!-- chats header -->
+        <Grid Grid.Row="1" Margin="1,12,0,6">
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock Text="ЧАТЫ" Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
+            <Border Background="#1E1E1E" CornerRadius="4" Padding="6,1" Margin="8,0,0,0" VerticalAlignment="Center">
+              <TextBlock x:Name="ChatCountText" Text="0" FontSize="10" FontWeight="SemiBold" Foreground="#A0A0A0"/>
+            </Border>
+          </StackPanel>
+          <Button x:Name="AddBtn" Style="{StaticResource GhostButton}" HorizontalAlignment="Right" Content="+ Добавить"/>
+        </Grid>
+
+        <!-- chats list -->
+        <ScrollViewer Grid.Row="2" MaxHeight="144" VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled" PanningMode="VerticalOnly">
+          <StackPanel x:Name="ChatPanel"/>
+        </ScrollViewer>
+
+        <!-- limit -->
+        <Grid Grid.Row="3" Margin="0,8,0,0">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="ЛИМИТ" Style="{StaticResource SectionLabel}" VerticalAlignment="Center" Margin="1,0,10,0"/>
+            <Grid Grid.Column="1">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition/>
+                <ColumnDefinition/>
+                <ColumnDefinition/>
+              </Grid.ColumnDefinitions>
+              <RadioButton x:Name="LimitNone" Content="Нет" Style="{StaticResource SegmentRadio}"
+                           GroupName="LimitMode" IsChecked="True" Margin="0,0,4,0"/>
+              <RadioButton x:Name="LimitCountRadio" Grid.Column="1" Content="Итерации"
+                           Style="{StaticResource SegmentRadio}" GroupName="LimitMode" Margin="0,0,4,0"/>
+              <RadioButton x:Name="LimitTimeRadio" Grid.Column="2" Content="До времени"
+                           Style="{StaticResource SegmentRadio}" GroupName="LimitMode"/>
+            </Grid>
+            <Grid Grid.Column="2">
+              <TextBox x:Name="CountBox" Width="62" Height="26" MaxLength="5" Text="50" Margin="8,0,0,0"
+                       HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                       TextAlignment="Center" Padding="4,2" FontSize="11.5" Visibility="Collapsed"/>
+              <TextBox x:Name="TimeBox" Width="62" Height="26" MaxLength="5" Text="18:00" Margin="8,0,0,0"
+                       HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                       TextAlignment="Center" Padding="4,2" FontSize="11.5" Visibility="Collapsed"/>
+            </Grid>
+          </Grid>
+          <Grid x:Name="ProgressRow" Grid.Row="1" Margin="1,9,0,0" Visibility="Collapsed">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <ProgressBar x:Name="LimitProgress" Height="3" Minimum="0" Maximum="1" Value="0" VerticalAlignment="Center"/>
+            <TextBlock x:Name="ProgressLabel" Grid.Column="1" Margin="10,0,0,0" FontSize="10"
+                       Foreground="#808080" VerticalAlignment="Center"/>
+          </Grid>
+        </Grid>
+
+        <!-- main action -->
+        <Button x:Name="MainActionBtn" Grid.Row="4" Style="{StaticResource PrimaryButton}" Margin="0,12,0,0">
+          <StackPanel Orientation="Horizontal">
+            <TextBlock x:Name="MainActionGlyph" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                       Text="&#xE71A;" FontSize="12" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <TextBlock x:Name="MainActionText" Text="ОСТАНОВИТЬ" VerticalAlignment="Center"/>
+          </StackPanel>
+        </Button>
+      </Grid>
+
+      <!-- ===== settings view ===== -->
+      <Grid x:Name="SettingsView" Grid.Row="1" Margin="14,4,14,12" Visibility="Collapsed">
+        <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
@@ -1131,198 +1230,58 @@ $uiXaml = @'
           <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <!-- hero -->
-        <Border x:Name="HeroCard" Grid.Row="0" CornerRadius="16" BorderThickness="1" BorderBrush="#223349"
-                ClipToBounds="True" Margin="0,0,0,14">
-          <Border.Background>
-            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-              <GradientStop Color="#132031" Offset="0"/>
-              <GradientStop Color="#0E1826" Offset="0.58"/>
-              <GradientStop Color="#0B1A18" Offset="1"/>
-            </LinearGradientBrush>
-          </Border.Background>
-          <Grid>
-            <Canvas ClipToBounds="True" IsHitTestVisible="False">
-              <Ellipse Canvas.Top="-190" Canvas.Right="-120" Width="380" Height="380">
-                <Ellipse.Fill>
-                  <RadialGradientBrush>
-                    <GradientStop Color="#3822C55E" Offset="0"/>
-                    <GradientStop Color="#0022C55E" Offset="1"/>
-                  </RadialGradientBrush>
-                </Ellipse.Fill>
-              </Ellipse>
-            </Canvas>
-            <Grid Margin="20,16,18,14">
-              <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-              </Grid.RowDefinitions>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-              </Grid.ColumnDefinitions>
+        <Grid Grid.Row="0" Margin="0,0,0,10">
+          <Button x:Name="BackBtn" Style="{StaticResource GhostButton}" HorizontalAlignment="Left">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Text="&#xE72B;" FontSize="10"
+                         VerticalAlignment="Center" Margin="0,0,7,0"/>
+              <TextBlock Text="Назад" VerticalAlignment="Center"/>
+            </StackPanel>
+          </Button>
+          <TextBlock Text="НАСТРОЙКИ" Style="{StaticResource SectionLabel}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+        </Grid>
 
-              <StackPanel Grid.Row="0" Grid.Column="0">
-                <StackPanel Orientation="Horizontal">
-                  <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#34D399" VerticalAlignment="Center">
-                    <Ellipse.Effect>
-                      <DropShadowEffect Color="#34D399" BlurRadius="12" ShadowDepth="0" Opacity="0.9"/>
-                    </Ellipse.Effect>
-                  </Ellipse>
-                  <TextBlock x:Name="StatusText" Text="РАБОТАЕТ" Margin="9,0,0,0" FontSize="10.5"
-                             FontWeight="Bold" Foreground="#6EE7B7"/>
-                  <TextBlock x:Name="StatusMeta" Text="· сервер" Margin="8,0,0,0" FontSize="10.5"
-                             Foreground="#6C7B91"/>
-                </StackPanel>
-                <TextBlock x:Name="HeroTitle" Text="Автопродолжение активно" Margin="0,10,0,0"
-                           FontSize="22" FontWeight="SemiBold" Foreground="#F1F5FB" TextTrimming="CharacterEllipsis"/>
-                <TextBlock x:Name="HeroSub" Text="" Margin="0,5,0,0" FontSize="11.5"
-                           Foreground="#8B99AE" TextTrimming="CharacterEllipsis"/>
+        <Border Grid.Row="1" Background="#141414" BorderBrush="#282828" BorderThickness="1" CornerRadius="8" Padding="14,4">
+          <StackPanel>
+            <CheckBox x:Name="AutoAddChk" Style="{StaticResource Switch}" Margin="0,9">
+              <StackPanel>
+                <TextBlock Text="Автодобавление чатов" Foreground="#EEEEEE" FontSize="12"/>
+                <TextBlock Text="подхватывать новые активные чаты" Foreground="#606060" FontSize="10" Margin="0,2,0,0"/>
               </StackPanel>
-
-              <StackPanel Grid.Row="0" Grid.Column="1" VerticalAlignment="Top" HorizontalAlignment="Right" Margin="24,0,0,0">
-                <Button x:Name="MainActionBtn" Style="{StaticResource PrimaryButton}" Width="176">
-                  <StackPanel Orientation="Horizontal">
-                    <TextBlock x:Name="MainActionGlyph" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
-                               Text="&#xE71A;" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                    <TextBlock x:Name="MainActionText" Text="ОСТАНОВИТЬ" VerticalAlignment="Center"/>
-                  </StackPanel>
-                </Button>
-                <TextBlock x:Name="LimitSummary" Text="без лимита" Margin="0,8,0,0" FontSize="10.5"
-                           Foreground="#7E8CA1" HorizontalAlignment="Right"/>
+            </CheckBox>
+            <Border Height="1" Background="#282828"/>
+            <CheckBox x:Name="TopmostChk" Style="{StaticResource Switch}" Margin="0,9">
+              <StackPanel>
+                <TextBlock Text="Поверх всех окон" Foreground="#EEEEEE" FontSize="12"/>
+                <TextBlock Text="окно не прячется за другими" Foreground="#606060" FontSize="10" Margin="0,2,0,0"/>
               </StackPanel>
-
-              <Grid x:Name="ProgressRow" Grid.Row="1" Grid.ColumnSpan="2" Margin="0,13,0,0">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*"/>
-                  <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <ProgressBar x:Name="LimitProgress" Height="4" Minimum="0" Maximum="1" Value="0"/>
-                <TextBlock x:Name="ProgressLabel" Grid.Column="1" Margin="10,0,0,0" FontSize="10"
-                           Foreground="#7E8CA1" VerticalAlignment="Center"/>
-              </Grid>
-            </Grid>
-          </Grid>
+            </CheckBox>
+          </StackPanel>
         </Border>
 
-        <!-- message + limits -->
-        <Grid Grid.Row="1" Margin="0,0,0,14">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="304"/>
-          </Grid.ColumnDefinitions>
-
-          <Border Style="{StaticResource Card}" Margin="0,0,12,0">
-            <Grid>
-              <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*"/>
-                <RowDefinition Height="Auto"/>
-              </Grid.RowDefinitions>
-              <TextBlock Text="СООБЩЕНИЕ" Style="{StaticResource SectionLabel}"/>
-              <TextBox x:Name="MessageBox" Grid.Row="1" Margin="0,8,0,0" Height="66"
-                       AcceptsReturn="True" TextWrapping="Wrap" MaxLength="4000"
-                       VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"/>
-              <Grid Grid.Row="2" Margin="0,10,0,0">
-                <CheckBox x:Name="AutoAddChk" Style="{StaticResource Switch}"
-                          Content="Автодобавление чатов" VerticalAlignment="Center" IsChecked="True"/>
-                <TextBlock Text="подхватывать активные сессии" HorizontalAlignment="Right"
-                           VerticalAlignment="Center" FontSize="10" Foreground="#66748A"/>
-              </Grid>
-            </Grid>
-          </Border>
-
-          <Border Grid.Column="1" Style="{StaticResource Card}">
-            <Grid>
-              <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*"/>
-              </Grid.RowDefinitions>
-              <TextBlock Text="ЛИМИТ ЗАПУСКА" Style="{StaticResource SectionLabel}"/>
-              <Grid Grid.Row="1" Margin="0,8,0,0">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition/>
-                  <ColumnDefinition/>
-                  <ColumnDefinition/>
-                </Grid.ColumnDefinitions>
-                <RadioButton x:Name="LimitNone" Content="Нет" Style="{StaticResource SegmentRadio}"
-                             GroupName="LimitMode" IsChecked="True" Margin="0,0,4,0"/>
-                <RadioButton x:Name="LimitCountRadio" Grid.Column="1" Content="Итерации"
-                             Style="{StaticResource SegmentRadio}" GroupName="LimitMode" Margin="0,0,4,0"/>
-                <RadioButton x:Name="LimitTimeRadio" Grid.Column="2" Content="До времени"
-                             Style="{StaticResource SegmentRadio}" GroupName="LimitMode"/>
-              </Grid>
-              <Grid Grid.Row="2" Margin="0,10,0,0" Height="34">
-                <StackPanel x:Name="CountPanel" Orientation="Horizontal">
-                  <TextBox x:Name="CountBox" Width="66" Height="34" MaxLength="5" Text="50"
-                           HorizontalContentAlignment="Center" VerticalContentAlignment="Center" TextAlignment="Center" Padding="10,5" FontSize="12"/>
-                  <TextBlock x:Name="CountUnit" Text="итераций" Margin="8,0,0,0" VerticalAlignment="Center"
-                             FontSize="11" Foreground="#8B99AE"/>
-                </StackPanel>
-                <StackPanel x:Name="TimePanel" Orientation="Horizontal" Visibility="Collapsed">
-                  <TextBox x:Name="TimeBox" Width="66" Height="34" MaxLength="5" Text="18:00"
-                           HorizontalContentAlignment="Center" VerticalContentAlignment="Center" TextAlignment="Center" Padding="10,5" FontSize="12"/>
-                  <TextBlock x:Name="TimeHint" Text="· сегодня" Margin="8,0,0,0" VerticalAlignment="Center"
-                             FontSize="11" Foreground="#66748A"/>
-                </StackPanel>
-              </Grid>
-              <TextBlock x:Name="LimitFootnote" Grid.Row="3" Text="работает, пока не остановите вручную"
-                         Margin="0,7,0,0" FontSize="10" Foreground="#66748A" TextWrapping="Wrap"/>
-            </Grid>
-          </Border>
-        </Grid>
-
-        <!-- chats header -->
-        <Grid Grid.Row="2" Margin="2,0,2,8">
-          <StackPanel Orientation="Horizontal">
-            <TextBlock Text="ЧАТЫ" Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
-            <Border Background="#101A29" BorderBrush="#1B2A3D" BorderThickness="1" CornerRadius="5"
-                    Padding="6,1" Margin="8,0,0,0" VerticalAlignment="Center">
-              <TextBlock x:Name="ChatCountText" Text="0" FontSize="9.5" FontWeight="SemiBold" Foreground="#7E93AD"/>
-            </Border>
-          </StackPanel>
-          <Button x:Name="AddBtn" Style="{StaticResource GhostButton}" HorizontalAlignment="Right"
-                  Content="+  Добавить"/>
-        </Grid>
-
-        <!-- chats list -->
-        <ScrollViewer Grid.Row="3" MaxHeight="156" VerticalScrollBarVisibility="Auto"
-                      HorizontalScrollBarVisibility="Disabled" Margin="0,0,0,10" PanningMode="VerticalOnly">
-          <StackPanel x:Name="ChatPanel"/>
-        </ScrollViewer>
-
-        <!-- log header -->
-        <Grid Grid.Row="4" Margin="2,2,2,8">
-          <StackPanel Orientation="Horizontal">
+        <Grid Grid.Row="2" Margin="1,14,0,6">
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock Text="ЖУРНАЛ" Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
-            <Ellipse x:Name="LogLiveDot" Width="5" Height="5" Fill="#34D399" Margin="8,0,0,0"
-                     VerticalAlignment="Center" Opacity="0.6"/>
+            <Ellipse x:Name="LogLiveDot" Width="5" Height="5" Fill="#7FD88F" Margin="8,0,0,0"
+                     VerticalAlignment="Center" Opacity="0.7"/>
           </StackPanel>
-          <Button x:Name="ClearBtn" Style="{StaticResource LinkButton}" Content="Очистить"
-                  HorizontalAlignment="Right"/>
+          <Button x:Name="ClearBtn" Style="{StaticResource LinkButton}" Content="Очистить" HorizontalAlignment="Right"/>
         </Grid>
 
-        <!-- log -->
-        <Border Grid.Row="5" Background="#070A10" BorderBrush="#182130" BorderThickness="1"
-                CornerRadius="12" Padding="1" ClipToBounds="True">
+        <Border Grid.Row="3" Background="#0F0F0F" BorderBrush="#282828" BorderThickness="1"
+                CornerRadius="8" Padding="1" ClipToBounds="True">
           <RichTextBox x:Name="LogBox" IsReadOnly="True" IsUndoEnabled="False" BorderThickness="0"
-                       Background="Transparent" Foreground="#93A4BD" Padding="10,8"
-                       FontFamily="Cascadia Mono, Consolas" FontSize="11"
+                       Background="Transparent" Foreground="#A0A0A0" Padding="10,8"
+                       FontFamily="Cascadia Mono, Consolas" FontSize="10.5"
                        VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
                        IsDocumentEnabled="False"/>
         </Border>
 
-        <!-- footer -->
-        <Grid Grid.Row="6" Margin="2,8,2,0">
-          <TextBlock x:Name="FooterText" Text="OpenCode AutoContinue · v1.3.0" FontSize="10"
-                     Foreground="#59677C" VerticalAlignment="Center"/>
+        <Grid Grid.Row="4" Margin="1,8,0,0">
+          <TextBlock x:Name="FooterText" Text="" FontSize="10" Foreground="#606060" VerticalAlignment="Center"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="TrayBtn" Style="{StaticResource LinkButton}" Content="Свернуть в трей"
-                    Margin="0,0,10,0" VerticalAlignment="Center"/>
-            <TextBlock x:Name="ServerText" Text="" FontSize="10" Foreground="#59677C"
-                       VerticalAlignment="Center"/>
+            <Button x:Name="DataBtn" Style="{StaticResource LinkButton}" Content="Папка данных" Margin="0,0,4,0"/>
+            <Button x:Name="TrayBtn" Style="{StaticResource LinkButton}" Content="В трей"/>
           </StackPanel>
         </Grid>
       </Grid>
@@ -1342,27 +1301,25 @@ function Find-Ui([string]$name) {
 $StatusDot = Find-Ui 'StatusDot'
 $StatusText = Find-Ui 'StatusText'
 $StatusMeta = Find-Ui 'StatusMeta'
-$HeroTitle = Find-Ui 'HeroTitle'
-$HeroSub = Find-Ui 'HeroSub'
+$MainView = Find-Ui 'MainView'
+$SettingsView = Find-Ui 'SettingsView'
+$SettingsBtn = Find-Ui 'SettingsBtn'
+$BackBtn = Find-Ui 'BackBtn'
 $MainActionBtn = Find-Ui 'MainActionBtn'
 $MainActionGlyph = Find-Ui 'MainActionGlyph'
 $MainActionText = Find-Ui 'MainActionText'
-$LimitSummary = Find-Ui 'LimitSummary'
 $ProgressRow = Find-Ui 'ProgressRow'
 $LimitProgress = Find-Ui 'LimitProgress'
 $ProgressLabel = Find-Ui 'ProgressLabel'
 $MessageBox = Find-Ui 'MessageBox'
+$MessageHint = Find-Ui 'MessageHint'
 $AutoAddChk = Find-Ui 'AutoAddChk'
+$TopmostChk = Find-Ui 'TopmostChk'
 $LimitNone = Find-Ui 'LimitNone'
 $LimitCountRadio = Find-Ui 'LimitCountRadio'
 $LimitTimeRadio = Find-Ui 'LimitTimeRadio'
-$CountPanel = Find-Ui 'CountPanel'
 $CountBox = Find-Ui 'CountBox'
-$CountUnit = Find-Ui 'CountUnit'
-$TimePanel = Find-Ui 'TimePanel'
 $TimeBox = Find-Ui 'TimeBox'
-$TimeHint = Find-Ui 'TimeHint'
-$LimitFootnote = Find-Ui 'LimitFootnote'
 $ChatCountText = Find-Ui 'ChatCountText'
 $AddBtn = Find-Ui 'AddBtn'
 $ChatPanel = Find-Ui 'ChatPanel'
@@ -1370,27 +1327,21 @@ $LogBox = Find-Ui 'LogBox'
 $LogLiveDot = Find-Ui 'LogLiveDot'
 $ClearBtn = Find-Ui 'ClearBtn'
 $FooterText = Find-Ui 'FooterText'
-$ServerText = Find-Ui 'ServerText'
 $TrayBtn = Find-Ui 'TrayBtn'
+$DataBtn = Find-Ui 'DataBtn'
 $DragArea = Find-Ui 'DragArea'
 $TitleIcon = Find-Ui 'TitleIcon'
-$PinBtn = Find-Ui 'PinBtn'
 $MinBtn = Find-Ui 'MinBtn'
-$MaxBtn = Find-Ui 'MaxBtn'
 $CloseBtn = Find-Ui 'CloseBtn'
-
-$FooterText.Text = "OpenCode AutoContinue · v$($script:AppVersion)"
 
 $script:BrushCache = @{}
 function Brush([string]$hex) {
     if (-not $script:BrushCache.ContainsKey($hex)) {
-        $script:BrushCache[$hex] = [Windows.Media.SolidColorBrush]::new([Windows.Media.ColorConverter]::ConvertFromString($hex))
+        $b = [Windows.Media.SolidColorBrush]::new([Windows.Media.ColorConverter]::ConvertFromString($hex))
+        $b.Freeze()
+        $script:BrushCache[$hex] = $b
     }
     return $script:BrushCache[$hex]
-}
-
-function Get-Color([string]$hex) {
-    return [Windows.Media.ColorConverter]::ConvertFromString($hex)
 }
 
 function Write-UiLog([string]$level, [string]$message) {
@@ -1441,59 +1392,65 @@ function Read-LimitCount {
 
 $script:Topmost = [bool]$settings.topmost
 $window.Topmost = $script:Topmost
-
-function Update-PinVisual {
-    if ($script:Topmost) {
-        $PinBtn.Foreground = Brush '#6EE7B7'
-        $PinBtn.ToolTip = 'Поверх всех окон: включено'
-    }
-    else {
-        $PinBtn.Foreground = Brush '#78879D'
-        $PinBtn.ToolTip = 'Поверх всех окон: выключено'
-    }
-}
-
-function Toggle-Maximize {
-    if ($window.WindowState -eq 'Maximized') { $window.WindowState = 'Normal' }
-    else { $window.WindowState = 'Maximized' }
-}
+$TopmostChk.IsChecked = $script:Topmost
 
 $DragArea.Add_MouseLeftButtonDown({
         param($sender, $e)
-        if ($e.ClickCount -eq 2) { Toggle-Maximize; return }
         try { $window.DragMove() } catch { }
     })
 
 $MinBtn.Add_Click({ $window.WindowState = 'Minimized' })
-$MaxBtn.Add_Click({ Toggle-Maximize })
 $CloseBtn.Add_Click({ $window.Close() })
-$PinBtn.Add_Click({
-        $script:Topmost = -not $script:Topmost
-        $window.Topmost = $script:Topmost
-        $settings.topmost = $script:Topmost
-        $script:Dirty = $true
-        Update-PinVisual
+
+# окно без рамки при разворачивании вылезает за экран — в этой утилите это не нужно
+$window.Add_StateChanged({
+        if ($window.WindowState -eq 'Maximized') { $window.WindowState = 'Normal' }
     })
 
-$window.Add_StateChanged({
-        if ($window.WindowState -eq 'Maximized') { $MaxBtn.Content = [string][char]0xE923 }
-        else { $MaxBtn.Content = [string][char]0xE922 }
-    })
+function Show-SettingsView([bool]$on) {
+    if ($on) {
+        $MainView.Visibility = 'Collapsed'
+        $SettingsView.Visibility = 'Visible'
+        $SettingsBtn.Foreground = Brush '#FAB283'
+        $LogBox.UpdateLayout()
+        $LogBox.ScrollToEnd()
+    }
+    else {
+        $SettingsView.Visibility = 'Collapsed'
+        $MainView.Visibility = 'Visible'
+        $SettingsBtn.Foreground = Brush '#808080'
+    }
+}
 
 # ---- иконка ----
+# PNG зашит в скрипт, поэтому иконка есть и у .exe, и у запуска из исходника.
+
+$script:IconPngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAKFklEQVR42uVba2hb1x3/nZd0dfWw1LlO2nrYJbQdKXTMDvYasopkbPVg+5AOwRj0S6CQDja2sX5oGDTZ6OigsDFSWAZjtOxTChuM4HV1mkztZjuL5TZNpjQkdtw0cdzUlezYet17HvsgXVVuLMd2ZFfqDujDtaVzz/93/u8HsIqVSCQYAIrWWTQej3MA5HZfvN0XKADtPfT392+hlD6std5mjLnbGMOahGBNCJklhEz6fL5zb7311vWa/zEAas0AJBIJ9uqrr6oK4U8opfY5jrPLdd0213WhlGqqK2eMgXMOn8+34PP5Rhhjfzp16tRRALqWllUB4P2gt7d3F4BfFwqFnXNzc1hYWIDrutoYo40xTQUAIQSEECqEoKFQCNFoFMFgMGWMeTaVSg0999xz9NChQwaAWREAj/gdO3Y847ruCzdu3KDZbFYZY0AppaS8mlLwjTEwxhittQaAWCzGOjo6IIQ4lEqlDlZo07UgLKEkHo/zZDIpe3t7f+U4zrNTU1PacRzDGGOEEDTbra/EDcYYKKWUEAJdXV0sEAgcHhsb+2GFRuWBwGpvfnBwUPX09PzMdd1fTExMuEopxjlvJe3/ab1AtdYkm83KcDj8aFdXFx8ZGXkjkUiwdDptqhzgsX1PT89XlVLDk5OTynVdxhgjrXLrK3GD1tpQStW2bdu4EOKbqVRqyKOZ1Jg79PT0nLp+/fqOTCajOOes1YmvBUFKqaLRKLv33nsvlEqlR9LptFvrMOj+/v5vF4vFHdlsVjHGPjfEe8qRc87m5uZUoVB4KBQKfQ+AicfjjHd0dBgAkFI+PTc3Z4wxWEnhUUpBaXOqBa01Kgag7spms8a27f0AXkkmk5oAwK5du+6en5+fnJqaCkkpTT07RwhBoVC47Us+S1a3bXsla2UIIaS7u9uNRCIPjIyMvM8BoFQqPeK6bsh1XU3rXC+lFKVSCbt378aePXuQy+WahhO01rBtG8PDwxgaGoLf7693SURKqaSUQkrZA6AMAIAHpJQwxmhCCF0OQUopXNfF7t27ceDAAbiuCyFEUwDgneXw4cMYHBxEIBBYFoCKaBvXdQHgQQDwAGhXSq3K0cnn85BSYnZ2FpzzpgBASon29nbkcrnVWgQAaK8FYNW+LaUUnPPqp1kW53xNImmMoWixGH9jgNtsM3THmY4Gm+GGAWCMgW3bCAQC8HyJRjszhBAUi0Xk8/mG7c8bdfPBYBAnTpzAm2++uZIZuqObL5VK6O/vx8DAAPL5fEM4oWEAWJaFkydP4sUXX9xQEXjqqaewd+9eLC4uNg8A3rJtG5xzRCIRz9Q0VMvfvHkTwWCwoXmJhitBKWX1syQ2pxS6nLG5I3uvtfYyP9W9Pv38mQGwkgJbWCyA+zgsHwclBFob6HUc2LMCQoiqH0IIAaUUjLHmA0Bpg3DAh+/0PYTTF6dxeSYDaAXCBQI+Ds4ojDEV7ri9F1coFJDJZJDJZKoEe15sLpdbs3XYUADKvreGX3C8/JMn4GiN4fQVDL0zgZPvXsb5KzdwM18ACIPlFxC8TNByoiKlhGVZOHr0KI4dOwatdZXYSsIWxWIRlmWtSf9smgjM5YrYelcIA30PYWDndji5As5O3cCJdycx9PYEUhenkZlfBAAIn4B/GVHxOKCez78eJ2nTnHlGCbQyKBWL5Rczit4H70Pvw1145rtfw+WZDP713/fxj/FL+Pf5K5iamQO0vEVUCGEryvpaFeGmRjOElIHwWLdUcKDzJVBKcH9HFPd/8W48+XgvMpkFnL54Da+/vXZRaUorUF+jE9BKIFpyJUzJBQgQtf14vO9LePzR9YlKywCwBAxCAFYGQyoDnSuWk5kriUr6CqZmMoBRIEwg4BetC8AtokJINU1xi6jc9wU8+Y2vYG4+j3NXbiB5dgp/G30PZ9//EJQQrIUPWiMfQD5RcFprQBuAUAT8Am22hUjQgk+w1tMBdTU5AFORaUYJ/D4B+DmgDD6cncfoex/g9fFL+OfZKZy/+hGMdAEmYPsFTKsCUOsNCs7AbR/AGVB0cOHqLJLnpvD6+CWMvvcBrs3OA8aACQ7b7wML+FtTCWpjoHU50eEXDMQvAEqQv5nHf85dw/F3JnH8nQmcmZzBzcU8AAKfXyActCo1vzLRUq3fFPLNZm2tDQxWZu3kuSlcuPYxpOMAlCHgF4iEbRhTAc0AqPEO1+sEbSoASmtQQmDZfkDw27K25SvLtDYGRhtIpZeEvvVij6YKhmoPdlfIhqM0Tp+/gjfOXF43a3POIYS4BQQv37/WRAzfaKYnhMCRCj/4/TGMXriKCx98BOm6y7K20re08CwhfGFhAfv27cPBgweRzWaXhMOxWAxHjhzB888/j3A4vGog+MZq9rLvv1go4Y9/Pw3KOQJ+Advy3cLaq7UUkUgEnZ2dCIfD1YSIlBJtbW2IxWLNGQwRQhAO2VVTdydaW0oJpRRKpVK1Vc/723rykA0FoLZsVs+hW6/r6e3LGAOldInC81Ji66kVNBQAr3CayWQ2jJvWk/bacAC8osXOnTuxf/9+WJa1IYWRYrGIxx57DMVisWHlsYYBkMvlMDAwgL17925YP2FtaaypAPAOl8/nsbi4uMFJlCYtjm7E4TYlEYP/88Vr4pTVRXA15a9mWd551qh4TS0AHzPGVmVevAJoe3t7U/UICSEQDAZX5U1Wzv1xFQBCyATnHPU6xLyb55xjeHgYL730UsPK0w3JK1T6E06ePAnOeV1OqDRZECEEKKUXawE4wznPCyHseo2SWmv4/X689tprGBwcbM7UYaVRcgVRMJxzxjmXPp9vvNY71b29vcenp6f3ZDIZvVKjdCu3yiqlVFtbG+3s7EyNj4/3ASA8Ho/TZDKpGWNHotHo17PZ7B29pFmXx9SxWIwwxv6ASrM0rUxP0EAg8FfLss5Go1EmpVTNOhazXuKllDoSiVDbti8zxv4MgCSTSUUBmEQiQZLJpKSU/mjLli0QQhittfm8gKC1BmNM3XPPPYQx9uPR0dFCIpGgAMpzf+l02iQSCXb8+PHLnZ2dJBQK7clms9IYQymlpJVvvpJDdLq7u32WZf02lUr9rnaMrlpOSafTiMfjfGRk5ERXV1d7OBx+dH5+XkspUZ6ZIi3J9pRS1d3dLYLB4MupVOrpmsmxao5iye8SiQStjM390nGcn8/MzGB+fl4CIIwxWt67ecfmABillAGgI5EI37p1K/x+/2/GxsZ+WrF4SxKPy1FSC8K3jDEv5HK5R7LZLBYXFyGlVKbypmYCwnNyOOcsGAwiFoshGAxeoJQeGBsb+8tyxNcDAMAnk2Tbt2/3hcPh70sp9zmO0+c4jt913aaKBbyUWaVzzLUsa4wx9vL09PQrV69eLax5dPbTIHjPfX199zPGvqyUeqCZhqcJIRrALKX0EiHkzOjo6KV6NKxr/9WOojeTDlztmf8HtQbED2JR8D0AAAAASUVORK5CYII='
+
+$script:AppIcon = $null
+$script:EmbeddedIcon = $null
+try {
+    $iconBytes = [Convert]::FromBase64String($script:IconPngB64)
+    $iconStream = New-Object IO.MemoryStream (, $iconBytes)
+    $bmp = New-Object Windows.Media.Imaging.BitmapImage
+    $bmp.BeginInit()
+    $bmp.CacheOption = 'OnLoad'
+    $bmp.StreamSource = $iconStream
+    $bmp.EndInit()
+    $bmp.Freeze()
+    $script:EmbeddedIcon = $bmp
+}
+catch { }
 
 $script:IconFile = Join-Path $script:ScriptDir 'app.ico'
-$script:AppIcon = $null
 if (Test-Path -LiteralPath $script:IconFile) {
     try {
         $uri = [Uri]::new((Resolve-Path -LiteralPath $script:IconFile).Path, [UriKind]::Absolute)
         $script:AppIcon = [Windows.Media.Imaging.BitmapFrame]::Create($uri)
-        $window.Icon = $script:AppIcon
-        $TitleIcon.Source = $script:AppIcon
     }
     catch { }
 }
-if ($null -eq $script:AppIcon -and $exePath) {
+if ($null -eq $script:AppIcon -and $exePath -and $isCompiled) {
     try {
         $sysIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
         if ($sysIcon) {
@@ -1503,20 +1460,20 @@ if ($null -eq $script:AppIcon -and $exePath) {
                 [Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
             $src.Freeze()
             $script:AppIcon = $src
-            $window.Icon = $src
-            $TitleIcon.Source = $src
             $sysIcon.Dispose()
         }
     }
     catch { }
 }
-if ($null -eq $script:AppIcon) { $TitleIcon.Visibility = 'Collapsed' }
+if ($null -eq $script:AppIcon) { $script:AppIcon = $script:EmbeddedIcon }
+if ($script:AppIcon) { $window.Icon = $script:AppIcon }
+if ($script:EmbeddedIcon) { $TitleIcon.Source = $script:EmbeddedIcon }
+elseif ($script:AppIcon) { $TitleIcon.Source = $script:AppIcon }
+else { $TitleIcon.Visibility = 'Collapsed' }
 
 # ---- лог ----
 
 $script:LogCount = 0
-$logParagraph = [Windows.Documents.Paragraph]::new()
-$logParagraph.Margin = [Windows.Thickness]::new(0)
 $LogBox.Document.Blocks.Clear()
 $LogBox.Document.PagePadding = [Windows.Thickness]::new(0)
 
@@ -1529,10 +1486,10 @@ function Add-LogLine([string]$entry) {
         $text = $entry.Substring($tab + 1)
     }
     $color = switch ($level) {
-        'ok' { '#6EE7B7' }
-        'warn' { '#FBBF24' }
-        'err' { '#F87171' }
-        default { '#93A4BD' }
+        'ok' { '#7FD88F' }
+        'warn' { '#F5A742' }
+        'err' { '#E06C75' }
+        default { '#A0A0A0' }
     }
 
     $timePart = ''
@@ -1544,9 +1501,9 @@ function Add-LogLine([string]$entry) {
 
     $para = [Windows.Documents.Paragraph]::new()
     $para.Margin = [Windows.Thickness]::new(0)
-    $para.LineHeight = 17
+    $para.LineHeight = 16
     $runTime = [Windows.Documents.Run]::new($timePart)
-    $runTime.Foreground = Brush '#4C5B72'
+    $runTime.Foreground = Brush '#606060'
     $runBody = [Windows.Documents.Run]::new($bodyPart)
     $runBody.Foreground = Brush $color
     [void]$para.Inlines.Add($runTime)
@@ -1576,43 +1533,32 @@ function Add-LogLine([string]$entry) {
 
 function Update-LimitInputs {
     $mode = [string]$state.LimitMode
-    $CountPanel.Visibility = if ($mode -eq 'count') { 'Visible' } else { 'Collapsed' }
-    $TimePanel.Visibility = if ($mode -eq 'time') { 'Visible' } else { 'Collapsed' }
+    $CountBox.Visibility = if ($mode -eq 'count') { 'Visible' } else { 'Collapsed' }
+    $TimeBox.Visibility = if ($mode -eq 'time') { 'Visible' } else { 'Collapsed' }
+    $ProgressRow.Visibility = if ($mode -eq 'none') { 'Collapsed' } else { 'Visible' }
 
-    switch ($mode) {
-        'count' {
-            $CountUnit.Text = Plural $state.LimitCount 'итерация' 'итерации' 'итераций'
-            $LimitFootnote.Text = "остановится после $($state.LimitCount) $(Plural $state.LimitCount 'итерации' 'итерации' 'итераций')"
+    $CountBox.ToolTip = 'Сколько отправок за запуск'
+    if ($mode -eq 'time') {
+        $parsed = Parse-TimeText $TimeBox.Text
+        if ($parsed) {
+            $deadline = Get-NextDeadline $parsed.Hour $parsed.Minute
+            $day = if ($deadline.Date -eq (Get-Date).Date) { 'сегодня' } else { 'завтра' }
+            $TimeBox.ToolTip = "Остановится в $($parsed.Text) · $day"
         }
-        'time' {
-            $parsed = Parse-TimeText $TimeBox.Text
-            if ($parsed) {
-                $deadline = Get-NextDeadline $parsed.Hour $parsed.Minute
-                $day = if ($deadline.Date -eq (Get-Date).Date) { 'сегодня' } else { 'завтра' }
-                $LimitFootnote.Text = "остановится в $($parsed.Text) · $day"
-                $TimeHint.Text = '· ' + $day
-            }
-            else {
-                $LimitFootnote.Text = 'укажите время в формате ЧЧ:ММ'
-                $TimeHint.Text = '· —'
-            }
-        }
-        default {
-            $LimitFootnote.Text = 'работает, пока не остановите вручную'
+        else {
+            $TimeBox.ToolTip = 'Формат: ЧЧ:ММ'
         }
     }
-
-    $ProgressRow.Visibility = if ($mode -eq 'none') { 'Collapsed' } else { 'Visible' }
 }
 
 function Apply-LimitFromUi {
     $count = Read-LimitCount
     if ($count -gt 0) {
         $state.LimitCount = $count
-        $CountBox.BorderBrush = Brush '#223047'
+        $CountBox.BorderBrush = Brush '#282828'
     }
     else {
-        $CountBox.BorderBrush = Brush '#7F1D1D'
+        $CountBox.BorderBrush = Brush '#E06C75'
     }
 
     $parsed = Parse-TimeText $TimeBox.Text
@@ -1620,11 +1566,11 @@ function Apply-LimitFromUi {
         $state.LimitTime = $parsed.Text
         $state.DeadlineTicks = (Get-NextDeadline $parsed.Hour $parsed.Minute).Ticks
         $state.LimitSince = Get-Date
-        $TimeBox.BorderBrush = Brush '#223047'
+        $TimeBox.BorderBrush = Brush '#282828'
     }
     else {
         $state.DeadlineTicks = [long]0
-        $TimeBox.BorderBrush = Brush '#7F1D1D'
+        $TimeBox.BorderBrush = Brush '#E06C75'
     }
 
     Update-LimitInputs
@@ -1675,6 +1621,23 @@ function Show-Balloon([string]$title, [string]$text) {
     catch { }
 }
 
+function Set-StatusLook([string]$label, [string]$color, [string]$glyph, [string]$action, [string]$btnBg, [string]$btnFg, [bool]$pulse) {
+    $StatusText.Text = $label
+    $StatusText.Foreground = Brush $color
+    $StatusDot.Fill = Brush $color
+    $MainActionGlyph.Text = $glyph
+    $MainActionText.Text = $action
+    $MainActionBtn.Background = Brush $btnBg
+    $MainActionBtn.Foreground = Brush $btnFg
+    if ($pulse -and $script:PulseAnimation) {
+        $StatusDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $script:PulseAnimation)
+    }
+    else {
+        $StatusDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
+        $StatusDot.Opacity = 1
+    }
+}
+
 function Update-StatusVisual {
     if ($null -eq $StatusDot) { return }
     $reason = [string]$state.StopReason
@@ -1688,59 +1651,10 @@ function Update-StatusVisual {
     if ($statusKey -ne $script:UiStatus) {
         $script:UiStatus = $statusKey
         switch ($statusKey) {
-            'running' {
-                $StatusText.Text = 'РАБОТАЕТ'
-                $StatusText.Foreground = Brush '#6EE7B7'
-                $StatusDot.Fill = Brush '#34D399'
-                $StatusDot.Effect.Color = Get-Color '#34D399'
-                $HeroTitle.Text = 'Автопродолжение активно'
-                $MainActionGlyph.Text = [string][char]0xE71A
-                $MainActionText.Text = 'ОСТАНОВИТЬ'
-                $MainActionBtn.Background = Brush '#F05252'
-                $MainActionBtn.Foreground = Brush '#FFFFFF'
-                if ($script:PulseAnimation) {
-                    $StatusDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $script:PulseAnimation)
-                }
-            }
-            'paused' {
-                $StatusText.Text = 'ПАУЗА'
-                $StatusText.Foreground = Brush '#FBBF24'
-                $StatusDot.Fill = Brush '#FBBF24'
-                $StatusDot.Effect.Color = Get-Color '#FBBF24'
-                $HeroTitle.Text = 'Автопродолжение на паузе'
-                $MainActionGlyph.Text = [string][char]0xE768
-                $MainActionText.Text = 'ЗАПУСТИТЬ'
-                $MainActionBtn.Background = Brush '#34D399'
-                $MainActionBtn.Foreground = Brush '#05170E'
-                $StatusDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
-                $StatusDot.Opacity = 1
-            }
-            'limit' {
-                $StatusText.Text = 'ЛИМИТ'
-                $StatusText.Foreground = Brush '#FBBF24'
-                $StatusDot.Fill = Brush '#FBBF24'
-                $StatusDot.Effect.Color = Get-Color '#FBBF24'
-                $HeroTitle.Text = 'Лимит запуска достигнут'
-                $MainActionGlyph.Text = [string][char]0xE768
-                $MainActionText.Text = 'НОВЫЙ ЗАПУСК'
-                $MainActionBtn.Background = Brush '#34D399'
-                $MainActionBtn.Foreground = Brush '#05170E'
-                $StatusDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
-                $StatusDot.Opacity = 1
-            }
-            'error' {
-                $StatusText.Text = 'НЕТ СВЯЗИ'
-                $StatusText.Foreground = Brush '#F87171'
-                $StatusDot.Fill = Brush '#F87171'
-                $StatusDot.Effect.Color = Get-Color '#F87171'
-                $HeroTitle.Text = 'OpenCode не отвечает'
-                $MainActionGlyph.Text = [string][char]0xE72C
-                $MainActionText.Text = 'ПОВТОРИТЬ'
-                $MainActionBtn.Background = Brush '#3B82F6'
-                $MainActionBtn.Foreground = Brush '#FFFFFF'
-                $StatusDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
-                $StatusDot.Opacity = 1
-            }
+            'running' { Set-StatusLook 'РАБОТАЕТ' '#7FD88F' ([string][char]0xE71A) 'ОСТАНОВИТЬ' '#E06C75' '#0A0A0A' $true }
+            'paused' { Set-StatusLook 'ПАУЗА' '#F5A742' ([string][char]0xE768) 'ЗАПУСТИТЬ' '#FAB283' '#0A0A0A' $false }
+            'limit' { Set-StatusLook 'ЛИМИТ' '#F5A742' ([string][char]0xE768) 'НОВЫЙ ЗАПУСК' '#FAB283' '#0A0A0A' $false }
+            'error' { Set-StatusLook 'НЕТ СВЯЗИ' '#E06C75' ([string][char]0xE72C) 'ПОВТОРИТЬ' '#5C9CF5' '#0A0A0A' $false }
         }
 
         if ($reason -ne $script:LastReason) {
@@ -1763,7 +1677,7 @@ function Update-StatusVisual {
 }
 
 function Update-Stats {
-    if ($null -eq $HeroSub) { return }
+    if ($null -eq $StatusMeta) { return }
     $chats = @($state.Chats)
     $chatCount = $chats.Count
     $sent = [int]$state.SentThisRun
@@ -1771,16 +1685,13 @@ function Update-Stats {
 
     if ($running) {
         $elapsed = if ($state.RunStartedAt -ne [datetime]::MinValue) { Format-Duration ((Get-Date) - [datetime]$state.RunStartedAt) } else { '00:00:00' }
-        $HeroSub.Text = "$chatCount $(Plural $chatCount 'чат' 'чата' 'чатов') · $sent $(Plural $sent 'отправка' 'отправки' 'отправок') · в работе $elapsed"
+        $StatusMeta.Text = "$sent отпр. · $elapsed"
     }
     elseif ([string]$state.StopReason -eq 'error') {
-        $HeroSub.Text = "$chatCount $(Plural $chatCount 'чат' 'чата' 'чатов') · переподключение в фоне · отправлено $sent"
-    }
-    elseif ([string]$state.StopReason -eq 'limit') {
-        $HeroSub.Text = "$chatCount $(Plural $chatCount 'чат' 'чата' 'чатов') · $sent $(Plural $sent 'отправка' 'отправки' 'отправок') за запуск"
+        $StatusMeta.Text = 'переподключаюсь…'
     }
     else {
-        $HeroSub.Text = "$chatCount $(Plural $chatCount 'чат' 'чата' 'чатов') · $sent $(Plural $sent 'отправка' 'отправки' 'отправок')"
+        $StatusMeta.Text = "$sent отпр."
     }
 
     $ChatCountText.Text = [string]$chatCount
@@ -1790,12 +1701,10 @@ function Update-Stats {
     if ($mode -eq 'count') {
         $limit = [Math]::Max(1, [int]$state.LimitCount)
         $value = [Math]::Min($sent, $limit)
-        $LimitSummary.Text = "$value / $limit итераций"
         $LimitProgress.Maximum = $limit
         $LimitProgress.Value = $value
-        $LimitProgress.Foreground = if ($value -ge $limit) { Brush '#FBBF24' } else { Brush '#34D399' }
+        $LimitProgress.Foreground = if ($value -ge $limit) { Brush '#F5A742' } else { Brush '#FAB283' }
         $ProgressLabel.Text = "$value / $limit"
-        $LimitSummary.Foreground = Brush '#8B99AE'
     }
     elseif ($mode -eq 'time') {
         $deadline = if ([long]$state.DeadlineTicks -gt 0) { [datetime]::new([long]$state.DeadlineTicks) } else { $null }
@@ -1803,14 +1712,12 @@ function Update-Stats {
         if ($null -ne $deadline) {
             $left = $deadline - $now
             if ($left.TotalSeconds -le 0) {
-                $LimitSummary.Text = "до $($deadline.ToString('HH:mm')) · время вышло"
-                $ProgressLabel.Text = '00:00:00'
+                $ProgressLabel.Text = "до $($deadline.ToString('HH:mm')) · время вышло"
                 $LimitProgress.Value = 1
-                $LimitProgress.Foreground = Brush '#FBBF24'
+                $LimitProgress.Foreground = Brush '#F5A742'
             }
             else {
-                $LimitSummary.Text = "до $($deadline.ToString('HH:mm')) · осталось $(Format-Duration $left)"
-                $ProgressLabel.Text = "осталось $(Format-Duration $left)"
+                $ProgressLabel.Text = "до $($deadline.ToString('HH:mm')) · осталось $(Format-Duration $left)"
                 $start = [datetime]$state.RunStartedAt
                 if ($state.LimitSince -ne [datetime]::MinValue -and [datetime]$state.LimitSince -gt $start) { $start = [datetime]$state.LimitSince }
                 if ($start -ne [datetime]::MinValue -and $deadline -gt $start) {
@@ -1821,19 +1728,15 @@ function Update-Stats {
                 else {
                     $LimitProgress.Value = 0
                 }
-                $LimitProgress.Foreground = Brush '#34D399'
+                $LimitProgress.Foreground = Brush '#FAB283'
             }
         }
         else {
-            $LimitSummary.Text = 'время не задано'
-            $ProgressLabel.Text = ''
+            $ProgressLabel.Text = 'время не задано'
             $LimitProgress.Value = 0
         }
-        $LimitSummary.Foreground = Brush '#8B99AE'
     }
     else {
-        $LimitSummary.Text = 'без лимита'
-        $LimitSummary.Foreground = Brush '#7E8CA1'
         $LimitProgress.Maximum = 1
         $LimitProgress.Value = 0
         $ProgressLabel.Text = ''
@@ -1842,12 +1745,11 @@ function Update-Stats {
     if ($state.BaseUrl -ne $script:LastServer) {
         $script:LastServer = [string]$state.BaseUrl
         $short = $script:LastServer -replace '^https?://', ''
-        $ServerText.Text = $short
-        $StatusMeta.Text = "· $short"
+        $FooterText.Text = "v$($script:AppVersion) · $short"
     }
 
-    $LogLiveDot.Fill = if ($running) { Brush '#34D399' } else { Brush '#4B5A71' }
-    $LogLiveDot.Opacity = if ($running) { 0.85 } else { 0.35 }
+    $LogLiveDot.Fill = if ($running) { Brush '#7FD88F' } else { Brush '#606060' }
+    $LogLiveDot.Opacity = if ($running) { 0.85 } else { 0.4 }
 }
 
 # ---- строки чатов ----
@@ -1857,27 +1759,27 @@ $script:LastSig = ''
 
 function Get-ChatPhaseColor($chat) {
     switch ([string]$chat.Phase) {
-        'running' { return '#FBBF24' }
-        'sent' { return '#60A5FA' }
-        'blocked' { return '#F87171' }
+        'running' { return '#F5A742' }
+        'sent' { return '#5C9CF5' }
+        'blocked' { return '#E06C75' }
         default {
-            if ([string]$chat.Status -like 'ошибка*') { return '#F87171' }
-            if ([string]$chat.Status -like 'ответ получен*') { return '#34D399' }
-            return '#62718A'
+            if ([string]$chat.Status -like 'ошибка*') { return '#E06C75' }
+            if ([string]$chat.Status -like 'ответ получен*') { return '#7FD88F' }
+            return '#606060'
         }
     }
 }
 
 function New-ChatRow($chat) {
     $row = [Windows.Controls.Border]::new()
-    $row.Background = Brush '#101822'
-    $row.BorderBrush = Brush '#1C2838'
+    $row.Background = Brush '#141414'
+    $row.BorderBrush = Brush '#282828'
     $row.BorderThickness = [Windows.Thickness]::new(1)
-    $row.CornerRadius = [Windows.CornerRadius]::new(11)
-    $row.Padding = [Windows.Thickness]::new(12, 7, 8, 7)
-    $row.Margin = [Windows.Thickness]::new(0, 0, 0, 6)
-    $row.Add_MouseEnter({ $this.Background = Brush '#131D2A'; $this.BorderBrush = Brush '#27364A' })
-    $row.Add_MouseLeave({ $this.Background = Brush '#101822'; $this.BorderBrush = Brush '#1C2838' })
+    $row.CornerRadius = [Windows.CornerRadius]::new(6)
+    $row.Padding = [Windows.Thickness]::new(11, 6, 6, 6)
+    $row.Margin = [Windows.Thickness]::new(0, 0, 0, 4)
+    $row.Add_MouseEnter({ $this.Background = Brush '#1A1A1A'; $this.BorderBrush = Brush '#3C3C3C' })
+    $row.Add_MouseLeave({ $this.Background = Brush '#141414'; $this.BorderBrush = Brush '#282828' })
 
     $grid = [Windows.Controls.Grid]::new()
     foreach ($w in @('Auto', '*', 'Auto', 'Auto')) {
@@ -1887,32 +1789,27 @@ function New-ChatRow($chat) {
     }
 
     $dot = [Windows.Shapes.Ellipse]::new()
-    $dot.Width = 7
-    $dot.Height = 7
-    $dot.Margin = [Windows.Thickness]::new(0, 0, 11, 0)
+    $dot.Width = 6
+    $dot.Height = 6
+    $dot.Margin = [Windows.Thickness]::new(0, 0, 10, 0)
     $dot.VerticalAlignment = 'Center'
     $dot.Fill = Brush (Get-ChatPhaseColor $chat)
-    $dotGlow = [Windows.Media.Effects.DropShadowEffect]::new()
-    $dotGlow.BlurRadius = 9
-    $dotGlow.ShadowDepth = 0
-    $dotGlow.Opacity = 0.55
-    $dotGlow.Color = Get-Color (Get-ChatPhaseColor $chat)
-    $dot.Effect = $dotGlow
     $grid.Children.Add($dot) | Out-Null
 
     $stack = [Windows.Controls.StackPanel]::new()
     $stack.VerticalAlignment = 'Center'
     $title = [Windows.Controls.TextBlock]::new()
     $title.Text = if ($chat.Title) { [string]$chat.Title } else { '(без названия)' }
-    $title.FontSize = 12.5
+    $title.FontSize = 12
     $title.FontWeight = [Windows.FontWeights]::SemiBold
-    $title.Foreground = Brush '#E8EEF7'
+    $title.Foreground = Brush '#EEEEEE'
     $title.TextTrimming = 'CharacterEllipsis'
+    $title.ToolTip = $title.Text
     $status = [Windows.Controls.TextBlock]::new()
     $status.Text = [string]$chat.Status
     $status.FontSize = 10
     $status.Margin = [Windows.Thickness]::new(0, 1, 0, 0)
-    $status.Foreground = Brush '#7C8AA0'
+    $status.Foreground = Brush '#808080'
     $status.TextTrimming = 'CharacterEllipsis'
     [void]$stack.Children.Add($title)
     [void]$stack.Children.Add($status)
@@ -1920,18 +1817,16 @@ function New-ChatRow($chat) {
     $grid.Children.Add($stack) | Out-Null
 
     $countBadge = [Windows.Controls.Border]::new()
-    $countBadge.Background = Brush '#0E1929'
-    $countBadge.BorderBrush = Brush '#1A2A3E'
-    $countBadge.BorderThickness = [Windows.Thickness]::new(1)
-    $countBadge.CornerRadius = [Windows.CornerRadius]::new(6)
+    $countBadge.Background = Brush '#1E1E1E'
+    $countBadge.CornerRadius = [Windows.CornerRadius]::new(4)
     $countBadge.Padding = [Windows.Thickness]::new(7, 2, 7, 2)
-    $countBadge.Margin = [Windows.Thickness]::new(0, 0, 10, 0)
+    $countBadge.Margin = [Windows.Thickness]::new(8, 0, 6, 0)
     $countBadge.VerticalAlignment = 'Center'
     $countTb = [Windows.Controls.TextBlock]::new()
     $countTb.Text = [string]$chat.Count
     $countTb.FontSize = 10.5
     $countTb.FontWeight = [Windows.FontWeights]::SemiBold
-    $countTb.Foreground = Brush '#7DD3FC'
+    $countTb.Foreground = Brush '#FAB283'
     $countBadge.Child = $countTb
     $countBadge.ToolTip = 'Отправлено сообщений'
     [Windows.Controls.Grid]::SetColumn($countBadge, 2)
@@ -1940,7 +1835,7 @@ function New-ChatRow($chat) {
     $remove = [Windows.Controls.Border]::new()
     $remove.Width = 24
     $remove.Height = 24
-    $remove.CornerRadius = [Windows.CornerRadius]::new(6)
+    $remove.CornerRadius = [Windows.CornerRadius]::new(5)
     $remove.Background = [Windows.Media.Brushes]::Transparent
     $remove.Cursor = [Windows.Input.Cursors]::Hand
     $remove.VerticalAlignment = 'Center'
@@ -1949,12 +1844,12 @@ function New-ChatRow($chat) {
     $x = [Windows.Controls.TextBlock]::new()
     $x.Text = [string][char]0x2715
     $x.FontSize = 9.5
-    $x.Foreground = Brush '#62718A'
+    $x.Foreground = Brush '#606060'
     $x.HorizontalAlignment = 'Center'
     $x.VerticalAlignment = 'Center'
     $remove.Child = $x
-    $remove.Add_MouseEnter({ $this.Background = Brush '#2A1720'; $this.Child.Foreground = Brush '#F87171' })
-    $remove.Add_MouseLeave({ $this.Background = [Windows.Media.Brushes]::Transparent; $this.Child.Foreground = Brush '#62718A' })
+    $remove.Add_MouseEnter({ $this.Background = Brush '#2A1416'; $this.Child.Foreground = Brush '#E06C75' })
+    $remove.Add_MouseLeave({ $this.Background = [Windows.Media.Brushes]::Transparent; $this.Child.Foreground = Brush '#606060' })
     $remove.Add_MouseLeftButtonUp({ if ($this.Tag) { Remove-ChatFromUi $this.Tag } })
     [Windows.Controls.Grid]::SetColumn($remove, 3)
     $grid.Children.Add($remove) | Out-Null
@@ -1977,36 +1872,18 @@ function Build-ChatRows {
 
     if ($chats.Count -eq 0) {
         $empty = [Windows.Controls.Border]::new()
-        $empty.Background = Brush '#0C121B'
-        $empty.BorderBrush = Brush '#1A2637'
+        $empty.Background = Brush '#0F0F0F'
+        $empty.BorderBrush = Brush '#282828'
         $empty.BorderThickness = [Windows.Thickness]::new(1)
-        $empty.CornerRadius = [Windows.CornerRadius]::new(11)
-        $empty.Padding = [Windows.Thickness]::new(14, 12, 14, 12)
-        $inner = [Windows.Controls.StackPanel]::new()
-        $inner.Orientation = 'Horizontal'
-        $icon = [Windows.Controls.TextBlock]::new()
-        $icon.Text = [string][char]0xE8BD
-        $icon.FontFamily = [Windows.Media.FontFamily]::new('Segoe Fluent Icons, Segoe MDL2 Assets')
-        $icon.FontSize = 16
-        $icon.Foreground = Brush '#3B4B63'
-        $icon.VerticalAlignment = 'Center'
-        $icon.Margin = [Windows.Thickness]::new(0, 0, 10, 0)
-        $txt = [Windows.Controls.StackPanel]::new()
-        $t1 = [Windows.Controls.TextBlock]::new()
-        $t1.Text = 'Пока нет чатов'
-        $t1.FontSize = 12
-        $t1.FontWeight = [Windows.FontWeights]::SemiBold
-        $t1.Foreground = Brush '#B7C4D6'
-        $t2 = [Windows.Controls.TextBlock]::new()
-        $t2.Text = 'Включите авто-добавление или нажмите «+ Добавить».'
-        $t2.FontSize = 10.5
-        $t2.Margin = [Windows.Thickness]::new(0, 2, 0, 0)
-        $t2.Foreground = Brush '#66748A'
-        [void]$txt.Children.Add($t1)
-        [void]$txt.Children.Add($t2)
-        [void]$inner.Children.Add($icon)
-        [void]$inner.Children.Add($txt)
-        $empty.Child = $inner
+        $empty.CornerRadius = [Windows.CornerRadius]::new(6)
+        $empty.Padding = [Windows.Thickness]::new(12, 11, 12, 11)
+        $empty.Margin = [Windows.Thickness]::new(0, 0, 0, 4)
+        $t = [Windows.Controls.TextBlock]::new()
+        $t.Text = if ([bool]$state.AutoAdd) { 'Жду активные чаты OpenCode…' } else { 'Чатов нет — нажмите «+ Добавить»' }
+        $t.FontSize = 11
+        $t.Foreground = Brush '#606060'
+        $t.TextTrimming = 'CharacterEllipsis'
+        $empty.Child = $t
         $ChatPanel.Children.Add($empty) | Out-Null
         return
     }
@@ -2027,7 +1904,7 @@ function Update-ChatRows {
         $refs = $script:Rows[$i]
         if ($null -eq $refs) { continue }
         $titleText = if ($chat.Title) { [string]$chat.Title } else { '(без названия)' }
-        if ($refs.Title.Text -ne $titleText) { $refs.Title.Text = $titleText }
+        if ($refs.Title.Text -ne $titleText) { $refs.Title.Text = $titleText; $refs.Title.ToolTip = $titleText }
         $statusText = [string]$chat.Status
         if ($refs.Status.Text -ne $statusText) { $refs.Status.Text = $statusText }
         $countText = [string]$chat.Count
@@ -2037,7 +1914,6 @@ function Update-ChatRows {
         if ($refs.Phase -ne $color) {
             $refs.Phase = $color
             $refs.Dot.Fill = Brush $color
-            $refs.Dot.Effect.Color = Get-Color $color
             $refs.Status.Foreground = Brush $color
         }
         $refs.Element.Tag = [string]$chat.Id
@@ -2085,6 +1961,14 @@ function Start-Run {
 
     if ($state.RunStartedAt -eq [datetime]::MinValue -or $wasReason -eq 'limit') {
         $state.RunStartedAt = Get-Date
+    }
+
+    # после паузы таймер «ответ не начался» не должен считать время простоя
+    foreach ($c in @($state.Chats)) {
+        if ([string]$c.Phase -eq 'sent') {
+            $c.SentAt = Get-Date
+            $c.NoAnswer = 0
+        }
     }
 
     $state.Stop = $false
@@ -2141,16 +2025,16 @@ function Show-AddDialog {
     $dialogXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Добавить чат" Width="560" Height="520"
+        Title="Добавить чат" Width="400" Height="440"
         WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False"
-        WindowStartupLocation="CenterOwner" Background="#0A0E15" Foreground="#ECF1F8"
-        FontFamily="Segoe UI Variable Text, Segoe UI" UseLayoutRounding="True">
+        WindowStartupLocation="CenterOwner" Background="#0A0A0A" Foreground="#EEEEEE"
+        FontFamily="Cascadia Mono, Consolas" UseLayoutRounding="True">
   <Window.Resources>
     <Style TargetType="TextBox">
-      <Setter Property="Background" Value="#0A1019"/>
-      <Setter Property="Foreground" Value="#ECF1F8"/>
-      <Setter Property="CaretBrush" Value="#6EE7B7"/>
-      <Setter Property="BorderBrush" Value="#223047"/>
+      <Setter Property="Background" Value="#141414"/>
+      <Setter Property="Foreground" Value="#EEEEEE"/>
+      <Setter Property="CaretBrush" Value="#FAB283"/>
+      <Setter Property="BorderBrush" Value="#282828"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Padding" Value="10,7"/>
       <Setter Property="FontSize" Value="12"/>
@@ -2158,13 +2042,13 @@ function Show-AddDialog {
         <Setter.Value>
           <ControlTemplate TargetType="TextBox">
             <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="9">
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6">
               <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"
                             VerticalScrollBarVisibility="{TemplateBinding VerticalScrollBarVisibility}"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsKeyboardFocused" Value="True">
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#3F6E5C"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#FAB283"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -2182,15 +2066,15 @@ function Show-AddDialog {
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ListBoxItem">
-            <Border x:Name="Bd" Background="Transparent" CornerRadius="8" Padding="10,7" Margin="0,0,0,3">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="6" Padding="10,7" Margin="0,0,0,3">
               <ContentPresenter/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#131D2A"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
               </Trigger>
               <Trigger Property="IsSelected" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#12291F"/>
+                <Setter TargetName="Bd" Property="Background" Value="#282828"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -2212,7 +2096,7 @@ function Show-AddDialog {
                   <Thumb>
                     <Thumb.Template>
                       <ControlTemplate TargetType="Thumb">
-                        <Border Background="#2A374B" CornerRadius="3" Margin="1,2"/>
+                        <Border Background="#3C3C3C" CornerRadius="3" Margin="1,2"/>
                       </ControlTemplate>
                     </Thumb.Template>
                   </Thumb>
@@ -2227,11 +2111,11 @@ function Show-AddDialog {
       </Setter>
     </Style>
     <Style x:Key="DlgGhost" TargetType="Button">
-      <Setter Property="Height" Value="36"/>
+      <Setter Property="Height" Value="32"/>
       <Setter Property="Padding" Value="14,0"/>
-      <Setter Property="Background" Value="#111927"/>
-      <Setter Property="Foreground" Value="#A9B6C8"/>
-      <Setter Property="BorderBrush" Value="#223047"/>
+      <Setter Property="Background" Value="#141414"/>
+      <Setter Property="Foreground" Value="#A0A0A0"/>
+      <Setter Property="BorderBrush" Value="#282828"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="FontSize" Value="12"/>
       <Setter Property="Cursor" Value="Hand"/>
@@ -2239,13 +2123,13 @@ function Show-AddDialog {
         <Setter.Value>
           <ControlTemplate TargetType="Button">
             <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#172234"/>
-                <Setter Property="Foreground" Value="#E8EEF7"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1E1E1E"/>
+                <Setter Property="Foreground" Value="#EEEEEE"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
                 <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
@@ -2256,10 +2140,10 @@ function Show-AddDialog {
       </Setter>
     </Style>
     <Style x:Key="DlgPrimary" TargetType="Button">
-      <Setter Property="Height" Value="36"/>
+      <Setter Property="Height" Value="32"/>
       <Setter Property="Padding" Value="16,0"/>
-      <Setter Property="Background" Value="#34D399"/>
-      <Setter Property="Foreground" Value="#05170E"/>
+      <Setter Property="Background" Value="#FAB283"/>
+      <Setter Property="Foreground" Value="#0A0A0A"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="FontSize" Value="12"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
@@ -2268,8 +2152,8 @@ function Show-AddDialog {
         <Setter.Value>
           <ControlTemplate TargetType="Button">
             <Grid>
-              <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="8"/>
-              <Border x:Name="Hover" Background="#18FFFFFF" CornerRadius="8" Opacity="0"/>
+              <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="6"/>
+              <Border x:Name="Hover" Background="#18FFFFFF" CornerRadius="6" Opacity="0"/>
               <ContentPresenter Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Grid>
             <ControlTemplate.Triggers>
@@ -2288,7 +2172,7 @@ function Show-AddDialog {
       <Setter Property="Width" Value="30"/>
       <Setter Property="Height" Value="28"/>
       <Setter Property="Background" Value="Transparent"/>
-      <Setter Property="Foreground" Value="#78879D"/>
+      <Setter Property="Foreground" Value="#808080"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="FontFamily" Value="Segoe Fluent Icons, Segoe MDL2 Assets"/>
       <Setter Property="FontSize" Value="10.5"/>
@@ -2296,13 +2180,13 @@ function Show-AddDialog {
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="7">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="5">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#B91C1C"/>
-                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter TargetName="Bd" Property="Background" Value="#E06C75"/>
+                <Setter Property="Foreground" Value="#0A0A0A"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -2310,32 +2194,32 @@ function Show-AddDialog {
       </Setter>
     </Style>
   </Window.Resources>
-  <Border Background="#0A0E15" BorderBrush="#1C2838" BorderThickness="1">
+  <Border Background="#0A0A0A" BorderBrush="#282828" BorderThickness="1">
     <Grid>
       <Grid.RowDefinitions>
-        <RowDefinition Height="46"/>
+        <RowDefinition Height="36"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
-        <RowDefinition Height="60"/>
+        <RowDefinition Height="56"/>
       </Grid.RowDefinitions>
-      <Border Grid.Row="0" BorderBrush="#141D2A" BorderThickness="0,0,0,1">
+      <Border Grid.Row="0" BorderBrush="#282828" BorderThickness="0,0,0,1">
         <Grid>
-          <TextBlock x:Name="DlgTitle" Text="Добавить чат" FontSize="12.5" FontWeight="SemiBold" Foreground="#E8EEF7"
-                     VerticalAlignment="Center" Margin="16,0,0,0"/>
+          <TextBlock x:Name="DlgTitle" Text="Добавить чат" FontSize="11.5" FontWeight="SemiBold" Foreground="#EEEEEE"
+                     VerticalAlignment="Center" Margin="14,0,0,0"/>
           <Button x:Name="DlgCloseBtn" Style="{StaticResource DlgClose}" HorizontalAlignment="Right" Margin="0,0,8,0"
                   Content="&#xE8BB;"/>
         </Grid>
       </Border>
-      <Grid Grid.Row="1" Margin="18,12,18,8">
+      <Grid Grid.Row="1" Margin="14,8,14,8">
         <TextBox x:Name="SearchBox" Height="34" Padding="10,5" VerticalContentAlignment="Center"/>
-        <TextBlock x:Name="SearchHint" Text="Поиск по названию…" FontSize="11.5" Foreground="#5C6B80"
+        <TextBlock x:Name="SearchHint" Text="Поиск по названию…" FontSize="11.5" Foreground="#606060"
                    Margin="11,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
       </Grid>
-      <ListBox x:Name="SessionList" Grid.Row="2" Margin="18,0,18,0"/>
-      <Grid Grid.Row="3" Margin="18,10,18,14">
+      <ListBox x:Name="SessionList" Grid.Row="2" Margin="14,0,14,0"/>
+      <Grid Grid.Row="3" Margin="14,10,14,12">
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button x:Name="DlgCancelBtn" Width="96" Content="Отмена" Style="{StaticResource DlgGhost}"/>
-          <Button x:Name="DlgAddBtn" Width="120" Content="Добавить" Margin="8,0,0,0" Style="{StaticResource DlgPrimary}"/>
+          <Button x:Name="DlgCancelBtn" Width="88" Content="Отмена" Style="{StaticResource DlgGhost}"/>
+          <Button x:Name="DlgAddBtn" Width="108" Content="Добавить" Margin="8,0,0,0" Style="{StaticResource DlgPrimary}"/>
         </StackPanel>
       </Grid>
     </Grid>
@@ -2385,14 +2269,14 @@ function Show-AddDialog {
             $tt.Text = $title
             $tt.FontSize = 12
             $tt.FontWeight = [Windows.FontWeights]::SemiBold
-            $tt.Foreground = Brush '#E8EEF7'
+            $tt.Foreground = Brush '#EEEEEE'
             $tt.TextTrimming = 'CharacterEllipsis'
             $mm = [Windows.Controls.TextBlock]::new()
             $meta = if ($when) { "$when  ·  " } else { '' }
             $mm.Text = $meta + [string]$s.id
             $mm.FontSize = 9.5
             $mm.Margin = [Windows.Thickness]::new(0, 1, 0, 0)
-            $mm.Foreground = Brush '#66748A'
+            $mm.Foreground = Brush '#606060'
             $mm.TextTrimming = 'CharacterEllipsis'
             [void]$panel.Children.Add($tt)
             [void]$panel.Children.Add($mm)
@@ -2428,6 +2312,7 @@ function Show-AddDialog {
 # ---- настройки из контролов ----
 
 $MessageBox.Text = [string]$state.Message
+$MessageHint.Visibility = if ($MessageBox.Text.Length -gt 0) { 'Collapsed' } else { 'Visible' }
 $AutoAddChk.IsChecked = [bool]$state.AutoAdd
 $CountBox.Text = [string]$state.LimitCount
 $TimeBox.Text = [string]$state.LimitTime
@@ -2436,13 +2321,32 @@ $TimeBox.Text = [string]$state.LimitTime
 
 $MessageBox.Add_TextChanged({
         $state.Message = $MessageBox.Text
+        $MessageHint.Visibility = if ($MessageBox.Text.Length -gt 0) { 'Collapsed' } else { 'Visible' }
         $script:Dirty = $true
     })
 
 $AutoAddChk.Add_Click({
         $state.AutoAdd = [bool]$AutoAddChk.IsChecked
         Write-UiLog 'info' ('Автодобавление чатов: ' + $(if ($state.AutoAdd) { 'вкл' } else { 'выкл' }))
+        Build-ChatRows
         $script:Dirty = $true
+    })
+
+$TopmostChk.Add_Click({
+        $script:Topmost = [bool]$TopmostChk.IsChecked
+        $window.Topmost = $script:Topmost
+        $settings.topmost = $script:Topmost
+        $script:Dirty = $true
+    })
+
+$SettingsBtn.Add_Click({ Show-SettingsView ($SettingsView.Visibility -ne 'Visible') })
+$BackBtn.Add_Click({ Show-SettingsView $false })
+$window.Add_KeyDown({
+        param($s, $e)
+        if ($e.Key -eq 'Escape' -and $SettingsView.Visibility -eq 'Visible') {
+            Show-SettingsView $false
+            $e.Handled = $true
+        }
     })
 
 $LimitNone.Add_Checked({ if ($LimitNone.IsChecked) { Set-LimitModeUi 'none' } })
@@ -2477,6 +2381,9 @@ $ClearBtn.Add_Click({
         $script:LogCount = 0
     })
 $TrayBtn.Add_Click({ $window.Hide() })
+$DataBtn.Add_Click({
+        try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $script:AppDir + '"') } catch { }
+    })
 
 $window.Add_Loaded({
         $wa = [Windows.SystemParameters]::WorkArea
@@ -2502,9 +2409,9 @@ $window.Add_Closed({
         $timer.Stop()
 
         try {
-            $w = if ($window.WindowState -eq 'Maximized') { $window.RestoreBounds.Width } else { $window.ActualWidth }
-            $h = if ($window.WindowState -eq 'Maximized') { $window.RestoreBounds.Height } else { $window.ActualHeight }
-            if ($w -ge 720 -and $h -ge 680) {
+            $w = $window.ActualWidth
+            $h = $window.ActualHeight
+            if ($w -ge $window.MinWidth -and $h -ge $window.MinHeight) {
                 $settings.winWidth = [int]$w
                 $settings.winHeight = [int]$h
             }
@@ -2534,8 +2441,16 @@ try {
     if (Test-Path -LiteralPath $script:IconFile) {
         try { $trayIcon.Icon = New-Object System.Drawing.Icon -ArgumentList $script:IconFile } catch { }
     }
-    if (-not $trayIcon.Icon) {
+    if (-not $trayIcon.Icon -and $isCompiled) {
         try { $trayIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath) } catch { }
+    }
+    if (-not $trayIcon.Icon) {
+        try {
+            $pngStream = New-Object IO.MemoryStream (, [Convert]::FromBase64String($script:IconPngB64))
+            $pngBmp = New-Object System.Drawing.Bitmap $pngStream
+            $trayIcon.Icon = [System.Drawing.Icon]::FromHandle($pngBmp.GetHicon())
+        }
+        catch { }
     }
     if (-not $trayIcon.Icon) { $trayIcon.Icon = [System.Drawing.SystemIcons]::Application }
     $trayIcon.Text = 'OpenCode AutoContinue'
@@ -2574,7 +2489,7 @@ $timer.Add_Tick({
                 $drained++
             }
             foreach ($line in $lines) { Add-LogLine $line }
-            if ($lines.Count -gt 0) { $LogBox.ScrollToEnd() }
+            if ($lines.Count -gt 0 -and $SettingsView.Visibility -eq 'Visible') { $LogBox.ScrollToEnd() }
 
             $sigParts = @()
             foreach ($chat in @($state.Chats)) {
@@ -2608,7 +2523,6 @@ $script:LastStatusKey = ''
 
 # ---- старт ----
 
-Update-PinVisual
 Set-LimitModeUi ([string]$state.LimitMode)
 if ([string]$state.LimitMode -eq 'time') {
     $parsedTime = Parse-TimeText ([string]$state.LimitTime)
