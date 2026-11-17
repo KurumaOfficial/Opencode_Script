@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- License changed from MIT to GPL-3.0.
+
 ## 1.4.0
 
 ### Changed

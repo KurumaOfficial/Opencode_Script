@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 ![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)
 
@@ -204,4 +204,4 @@ LICENSE
 
 ## License
 
-[MIT](LICENSE)
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
