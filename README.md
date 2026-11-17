@@ -1,247 +1,212 @@
-<p align="center">
-  <img src="docs/icon.png" width="112" alt="OpenCode AutoContinue">
+# OpenCode AutoContinue
+
+[English](README.md) | [Русский](README.ru.md)
+
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)
+
+A small Windows utility that keeps [OpenCode](https://opencode.ai) sessions going. When the assistant finishes a response, the tool sends a preset message to that session, so a long task does not stall while it waits for you to type "continue".
+
+<!--
+Screenshots: save real captures as docs/screenshot-main.png and
+docs/screenshot-settings.png, then uncomment this block.
+
+<p>
+  <img src="docs/screenshot-main.png" width="360" alt="Main window">
+  <img src="docs/screenshot-settings.png" width="360" alt="Settings and log">
 </p>
+-->
 
-<h1 align="center">OpenCode AutoContinue</h1>
+## What it does
 
-<p align="center">
-  <b>Автопродолжение чатов OpenCode</b><br>
-  После каждого ответа бот сам получает «Продолжай разработку» — с лимитами<br>
-  и защитой от бесконечного спама ошибками.
-</p>
+OpenCode runs a local service. The tool polls that service for the list of active sessions. When a tracked session goes from working to idle, it posts your message to it. This repeats until you stop it, a limit is reached, or the connection to OpenCode is lost.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white" alt="Windows">
-  <img src="https://img.shields.io/badge/PowerShell-5.1-5391FE?logo=powershell&logoColor=white" alt="PowerShell 5.1">
-  <img src="https://img.shields.io/badge/.NET-WPF-512BD4?logo=dotnet&logoColor=white" alt=".NET WPF">
-  <img src="https://img.shields.io/badge/%D0%B2%D0%B5%D1%80%D1%81%D0%B8%D1%8F-1.3.0-34d399" alt="Версия 1.3.0">
-  <img src="https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-MIT-blue" alt="MIT">
-</p>
+The tool does not look at what the assistant wrote and cannot tell whether the task is finished. It only sends the text you set, every time.
 
-<p align="center">
-  <a href="https://github.com/KurumaOfficial/Opencode_Script/raw/main/dist/OpenCodeAutoContinue.exe"><b>⬇ Скачать OpenCodeAutoContinue.exe</b></a>
-</p>
+## Features
 
----
+- Tracks several sessions at once, each with its own status and send counter.
+- Sessions are identified by ID, so renaming a chat changes nothing.
+- Optional auto-add of newly active sessions (off by default).
+- Run limits: stop after N messages, or at a given time of day.
+- Retries with growing delays on errors, pauses itself after repeated failures, and reconnects when OpenCode comes back, including after a restart on a different port.
+- Tray icon and a single-instance guard.
+- Log file with automatic rotation.
 
-<p align="center">
-  <img src="docs/screenshot.png" width="680" alt="Скриншот утилиты">
-</p>
+## Requirements
 
-## ✨ Что нового в 1.3
+- Windows 10 or 11.
+- A running OpenCode. The tool talks to its local service and does nothing without it.
+- To run from source: Windows PowerShell 5.1, which ships with Windows. The prebuilt `.exe` needs nothing extra on a stock install.
 
-| | |
-|---|---|
-| 🎛 | **Новый интерфейс** — тёмная тема, живые статусы, прогресс лимита и аккуратный журнал |
-| ⏱ | **Лимит запуска** — остановиться после N итераций или в заданное время |
-| 🛡 | **Защита от спама ошибок** — повторы с паузой, авто-стоп и фоновое переподключение |
-| 🖼 | **Новая иконка** — в окне, на панели задач и в трее |
-| 📉 | **Ротация журнала** — файл больше не растёт без предела |
+## Installation
 
-## 🚀 Возможности
+### Prebuilt executable
 
-| | Возможность |
-|---|---|
-| 🔁 | **Несколько чатов одновременно** — у каждого свой статус и счётчик отправок |
-| 🎯 | **Авто-подхват активных чатов** — новый чат появляется в списке сам, как только в нём началась работа |
-| 🪪 | **Привязка по `sessionId`** — переименование чата ничего не ломает |
-| ✍️ | **Настраиваемый текст** — меняется прямо в окне, применяется сразу |
-| ⏱ | **Лимит по итерациям** — например, ровно 50 отправок за запуск |
-| 🕒 | **Лимит по времени** — например, до 18:00 (если время прошло — до завтрашнего 18:00) |
-| 🧠 | **Умные повторы** — ошибки отправки не долбят API каждую секунду |
-| 🔌 | **Авто-переподключение** — OpenCode перезапустился? Утилита подхватит новый порт и пароль |
-| ⏸ | **Мгновенная пауза** — одна кнопка, без перезапуска |
-| 📌 | **Иконка в трее** — управление доступно даже при свёрнутом окне |
-| 🧾 | **Журнал с уровнями** — ошибки, предупреждения и успешные отправки различаются цветом |
-| 🛡 | **Один экземпляр** — второй запуск не создаст двойную отправку |
+Download [`dist/OpenCodeAutoContinue.exe`](dist/OpenCodeAutoContinue.exe) and run it.
 
-## 📦 Установка
+The binary is produced by ps2exe and is not code-signed, so some antivirus products may flag it. If that bothers you, run the script from source or build the executable yourself (see [Building](#building)).
 
-### Вариант 1 — готовый `.exe` *(рекомендуется)*
-
-1. Скачайте [`dist/OpenCodeAutoContinue.exe`](dist/OpenCodeAutoContinue.exe).
-2. Положите в любое место и запустите.
-3. OpenCode должен быть запущен — утилита работает через его локальный сервис.
-
-> Настройки и журнал хранятся в `%APPDATA%\OpenCodeAutoContinue\`,
-> чтобы не мусорить рядом с `.exe`.
-
-### Вариант 2 — из исходников
+### From source
 
 ```powershell
 git clone https://github.com/KurumaOfficial/Opencode_Script.git
 cd Opencode_Script
-
-# запуск
 powershell -ExecutionPolicy Bypass -File AutoContinue.ps1
 ```
 
-Или просто двойной клик по `Запустить.cmd`.
+Double-clicking `Запустить.cmd` does the same without a console window.
 
-## 🖥 Как пользоваться
+Optional parameters when running the script:
 
-| Элемент | Действие |
+| Parameter | Meaning |
 |---|---|
-| **Текст сообщения** | Что отправлять боту после каждого ответа (можно многострочно) |
-| **Автодобавление чатов** | Подхватывать новые активные чаты без ручного добавления |
-| **+ Добавить** | Выбрать чат из последних 100 сессий (с поиском) |
-| **✕** у чата | Убрать чат и исключить его из авто-добавления |
-| **ОСТАНОВИТЬ / ЗАПУСТИТЬ** | Пауза и возобновление работы |
-| **НОВЫЙ ЗАПУСК** | Запуск после достижения лимита со сбросом счётчика |
-| **Лимит запуска** | `Нет`, `Итерации` или `До времени` |
-| **Очистить** | Очистить журнал на экране |
-| **Свернуть в трей** | Спрятать окно, оставив утилиту работать |
-| **✕** справа вверху | Полный выход из приложения |
+| `-PollMs <n>` | Polling interval in milliseconds. Default 1200, minimum 500. |
+| `-StartStopped` | Start paused. |
+| `-MessageText <text>` | Message to use when there is no saved setting yet. |
+| `-ChatTitles <a>,<b>` | Chats to track by exact title on the first run, before `settings.json` exists. |
 
-### ⏱ Лимиты
+## Usage
 
-**По итерациям.** Укажите число — утилита остановится после стольких
-успешных отправок за текущий запуск. Пауза и возобновление счётчик не сбрасывают;
-кнопка **НОВЫЙ ЗАПУСК** после срабатывания лимита начинает новый отсчёт.
+The interface is currently in Russian only. Labels are translated below.
 
-**До времени.** Укажите `ЧЧ:ММ` (например, `18:00`). Если это время сегодня уже
-прошло, лимит будет действовать до завтрашнего `18:00`. Лимит можно менять на ходу:
-новое время сразу применяется.
+The main window, top to bottom:
 
-Когда лимит достигнут, утилита ставит автопродолжение на паузу и показывает
-`ЛИМИТ` — ничего не отправляется, пока вы не запустите её снова.
+- **Message field.** The text sent after every response. Multi-line, up to 4000 characters. Changes apply immediately.
+- **Chats.** Tracked sessions with a status line, a send counter and a remove button. `+ Добавить` (Add) opens a picker with the 100 most recent sessions and a search box. Removing a chat also puts it on an ignore list so auto-add will not bring it back; adding it again from the picker clears that.
+- **Limit.** `Нет` (none), `Итерации` (iterations) or `До времени` (until a time). Enter a number or `HH:MM` in the field next to it. A thin progress bar shows how far the run is.
+- **Large button at the bottom.** Stops and resumes the run.
 
-### 🛡 Ошибки и переподключение
+The title bar shows the current state, the number of messages sent in this run and the run time. The gear button opens the settings view with the log, auto-add, always-on-top, a button that hides the window to the tray, and a shortcut to the data folder. `Esc` returns to the main view. The close button exits the application; to keep it running in the background, use the tray button in settings. The tray icon menu has Show window, Stop/Start and Exit.
 
-| Ситуация | Что делает утилита |
+| Label | Meaning |
 |---|---|
-| OpenCode не отвечает | Пишет ошибку **один раз**, повторяет с паузами 2 → 4 → 8 → 16 → 30 с |
-| 5 ошибок подряд | Ставит автопродолжение на паузу и проверяет связь в фоне каждые 12 с |
-| Связь вернулась | Два успешных ответа API — и работа продолжается автоматически |
-| OpenCode перезапустился | Перечитывает `service.json` и подхватывает новый адрес/пароль |
-| Ошибка отправки в чат | Повтор через 5 → 10 → 20 → 40 → 60 с; после 5 ошибок чат ставится на паузу |
-| Бот не начал отвечать за 45 с | Две повторные отправки, затем чат ставится на паузу |
-| `HTTP 401/403` | Сразу пауза: устарел пароль сервиса |
-| `HTTP 404` | Сессия удалена — чат убирается из списка |
+| `РАБОТАЕТ` | Running |
+| `ПАУЗА` | Paused by the user |
+| `ЛИМИТ` | Run limit reached |
+| `НЕТ СВЯЗИ` | OpenCode is unreachable; retrying in the background |
+| `ОСТАНОВИТЬ` / `ЗАПУСТИТЬ` | Stop / Start |
+| `НОВЫЙ ЗАПУСК` | Start a new run after a limit was reached |
+| `ПОВТОРИТЬ` | Retry the connection now |
 
-Повторяющиеся ошибки не дублируются в журнале: вы увидите первую ошибку,
-пятую попытку и итоговое решение. Журнал на диске ограничен 4 МБ,
-старая версия сохраняется как `auto-continue.log.1`.
+Per-chat status text:
 
-### Статусы чата
-
-| Статус | Значение |
+| Status | Meaning |
 |---|---|
-| `печатает…` | Бот работает, утилита ждёт завершения |
-| `ответ получен, ждём отправки` | Ответ закончился, сообщение уйдёт в ближайший тик |
-| `отправлено #N` | Сообщение отправлено, ждём ответа |
-| `ответ не начался — повтор` | Ответ не начался за 45 с — будет повторная отправка |
-| `ошибка отправки — повтор` | Сервер вернул ошибку, повтор отложен |
-| `ошибка — чат на паузе` | 5 ошибок подряд, чат больше не трогаем |
-| `бот не отвечает` | Три ответа подряд не начались, чат на паузе |
+| `ожидание ответа` | Waiting for the assistant to start |
+| `печатает…` | The assistant is responding; the tool waits |
+| `ответ получен, ждём отправки` | Response finished; the message goes out on the next poll |
+| `отправлено #N` | Message number N was sent; waiting for the response to start |
+| `ответ не начался — повтор` | No response within 45 seconds; will send again |
+| `ошибка отправки — повтор` | The server returned an error; a retry is scheduled |
+| `ошибка — чат на паузе` | Five send failures in a row; the chat is paused |
+| `бот не отвечает` | Three sends in a row got no response; the chat is paused |
 
-## ⚙️ Настройки
+A paused chat resumes by itself once the assistant starts working in it again.
 
-Всё хранится в `settings.json` (создаётся автоматически):
+### Limits
 
-```jsonc
-{
-  "message": "Продолжай разработку",   // текст, который уходит боту
-  "autoAdd": true,                     // подхватывать активные чаты
-  "chats": [                           // отслеживаемые чаты
-    { "id": "ses_...", "title": "45232" }
-  ],
-  "ignored": [ "ses_..." ],            // не добавлять автоматически
-  "limitMode": "none",                 // none | count | time
-  "limitCount": 50,                    // для limitMode = count
-  "limitTime": "18:00",                // для limitMode = time
-  "topmost": true                      // окно поверх остальных
-}
-```
+- **Iterations.** Counts messages sent successfully during the current run, across all chats. Pausing and resuming does not reset the counter. Pressing `НОВЫЙ ЗАПУСК` after the limit was hit does.
+- **Until time.** Enter `HH:MM`. If that time has already passed today, the deadline is the same time tomorrow. The value can be changed while the tool is running.
 
-Размер окна запоминается автоматически. Утилита считает адрес и пароль сервиса из
-`%USERPROFILE%\.local\state\opencode\service.json` — вводить ничего не нужно.
-Файл читается как UTF-8, поэтому настройки можно править в любом редакторе.
+When a limit is reached the tool pauses and sends nothing until you start it again.
 
-## 🔧 Как это работает
+### Errors and reconnection
 
-```mermaid
-flowchart LR
-    A["🖥 Окно"] --> B["⚙️ Наблюдатель"]
-    B -->|"кто работает?"| C[("☁️ OpenCode")]
-    B -->|"продолжай"| C
-    C -->|"ответ готов"| B
-    B -->|"статус и лог"| A
-```
-
-Ключевые запросы:
-
-| Метод | Назначение |
+| Situation | Behaviour |
 |---|---|
-| `GET /api/session/active` | Кто сейчас работает |
-| `GET /api/session/{id}` | Данные сессии (отсекаем под-агентов и архив) |
-| `POST /api/session/{id}/prompt` | Отправка сообщения с `delivery: queue` |
-| `DELETE` → `404` | Удалённые сессии автоматически убираются из списка |
+| OpenCode does not respond | Logs the error once and retries after 2, 4, 8 and 16 seconds. |
+| Fifth failure in a row | Pauses and checks the connection in the background: first after 8 seconds, then every 12. |
+| Connection is back | After two successful responses the run resumes on its own. |
+| OpenCode was restarted | Re-reads `service.json` and picks up the new address and password. |
+| Sending to a chat fails | Retries after 5, 10, 20 and 40 seconds. The fifth failure pauses that chat. |
+| No response within 45 seconds of a send | Sends again after a short delay. The third such timeout in a row pauses the chat. |
+| HTTP 401 or 403 when sending | Pauses immediately. The service password is out of date. |
+| HTTP 404 when sending | The session was deleted; the chat is removed from the list. |
 
-## 📁 Структура проекта
+Identical connection errors are logged once instead of on every attempt.
 
-```
-Opencode_Script/
-├─ AutoContinue.ps1        # исходник утилиты (WPF, без внешних зависимостей)
-├─ Запустить.cmd           # запуск из исходника
-├─ build.ps1               # сборка .exe через ps2exe
-├─ app.ico                 # иконка приложения (16–256 px)
-├─ dist/
-│  └─ OpenCodeAutoContinue.exe
-├─ docs/
-│  ├─ icon.png
-│  └─ screenshot.png
-├─ settings.example.json   # пример файла настроек
-├─ LICENSE
-└─ README.md
-```
+## Configuration
 
-## 🛠 Сборка `.exe`
+Settings are stored in `settings.json`. It is created on first run and rewritten by the application, so edit it only while the application is closed.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `schema` | number | `2` | Settings format version. Written by the application. |
+| `message` | string | `Продолжай разработку` | Text sent to the chats. |
+| `autoAdd` | boolean | `false` | Pick up newly active sessions automatically. |
+| `chats` | array | `[]` | Tracked sessions as `{ "id": "ses_...", "title": "..." }`. An entry with an empty `id` is resolved by its exact title. |
+| `ignored` | array | `[]` | Session IDs that auto-add must skip. |
+| `limitMode` | string | `none` | `none`, `count` or `time`. |
+| `limitCount` | number | `50` | Message limit, 1 to 99999. |
+| `limitTime` | string | `18:00` | Deadline as `HH:mm`. |
+| `topmost` | boolean | `true` | Keep the window above others. |
+| `winWidth`, `winHeight` | number | `400`, `520` | Window size, remembered on exit. |
+
+See [`settings.example.json`](settings.example.json) for a sample.
+
+Location:
+
+- Running from source: next to `AutoContinue.ps1`.
+- Running the `.exe`: `%APPDATA%\OpenCodeAutoContinue\`. On first run the executable imports a `settings.json` found next to it, if there is one.
+
+The log is `auto-continue.log` in the same folder. When it grows past 4 MB it is renamed to `auto-continue.log.1` and a new file is started.
+
+Settings written by version 1.3 are migrated automatically. Auto-add is switched off and the old window size is dropped.
+
+## How it works
+
+The tool reads the address, password and version of the local OpenCode service from `%USERPROFILE%\.local\state\opencode\service.json`, falling back to `%LOCALAPPDATA%\opencode\service.json`. It authenticates with HTTP Basic as `opencode:<password>`.
+
+| Request | Purpose |
+|---|---|
+| `GET /api/session/active` | Which sessions are working right now. |
+| `GET /api/session/{id}` | Session details. Sub-agent and archived sessions are skipped. |
+| `GET /api/session?limit=100` | Session list for the picker, and title lookup. |
+| `POST /api/session/{id}/prompt` | Sends the message with `delivery: queue`. |
+
+A background worker polls and sends. The window is WPF, built from XAML embedded in the script, and talks to the worker through shared state.
+
+## Things to know
+
+- **Self-looping.** If auto-add is on and you are working in the very session you use to discuss this tool, that session will be picked up and continued on its own. Keep auto-add off, or remove such sessions from the list.
+- **Every response costs a request.** The tool sends after each finished response and does not save tokens. Use a limit, and keep an eye on your provider's quota.
+- **One instance.** Starting a second copy shows a notice instead of creating a second watcher.
+
+## Troubleshooting
+
+| Symptom | Cause or fix |
+|---|---|
+| A message says the OpenCode service was not found | OpenCode is not running, so its service file does not exist. |
+| "Already running" | Look for the window in the taskbar or the icon in the tray. |
+| A chat does not show up | Turn on auto-add in settings, or add it with `+ Добавить`. |
+| Messages are not sent | Check the log in settings, or `auto-continue.log`. |
+| It sends too often | Set an iteration limit, or raise `-PollMs` when running from source. |
+| Silence after OpenCode restarted | The tool reconnects by itself. If it does not, press `ПОВТОРИТЬ`. |
+
+## Building
 
 ```powershell
-Install-Module ps2exe -Scope CurrentUser
 .\build.ps1
 ```
 
-Скрипт соберёт `dist\OpenCodeAutoContinue.exe`:
+The script installs the `ps2exe` module for the current user if it is missing and writes `dist\OpenCodeAutoContinue.exe`. The build uses `-noConsole`, `-STA` (required by WPF) and `-DPIAware`, and embeds `app.ico` and the version information.
 
-- `-noConsole` — без лишнего консольного окна;
-- `-STA` — обязательный режим для WPF;
-- `-DPIAware` — корректное масштабирование на HiDPI;
-- своя иконка, название и версия в свойствах файла.
+## Project layout
 
-## ❗ Важные нюансы
+```
+AutoContinue.ps1        the application (worker, WPF window, tray)
+Запустить.cmd           launcher for running from source
+build.ps1               builds the executable with ps2exe
+app.ico                 application icon, 16 to 256 px
+settings.example.json   sample settings file
+dist/                   prebuilt executable
+docs/                   icon and screenshots
+CHANGELOG.md
+LICENSE
+```
 
-**Защита от самозацикливания.** Если утилита работает в том же чате, где её
-обсуждают, авто-добавление подхватит этот чат и бот начнёт бесконечно
-продолжать сам себя. Такие сессии держите в `ignored` — они попадают туда
-кнопкой **✕** у чата и добавляются обратно вручную через **+ Добавить**.
+## License
 
-**Каждый ответ = запрос к модели.** Утилита не экономит токены: она
-отправляет сообщение после *каждого* завершённого ответа. Пользуйтесь лимитами
-и следите за лимитами провайдера.
-
-**Один экземпляр.** Повторный запуск `.exe` не создаст второй наблюдатель —
-приложение сообщит, что уже запущено.
-
-### Если что-то не работает
-
-| Симптом | Причина / решение |
-|---|---|
-| Окно не появилось | Не запущен OpenCode (его фоновый сервис) |
-| «Уже запущен» | Приложение уже работает — ищите окно в панели задач или значок в трее |
-| Чат не появляется | Включите автодобавление или добавьте вручную |
-| Сообщения не уходят | Проверьте журнал `auto-continue.log` |
-| Слишком часто отправляет | Задайте лимит итераций или увеличьте `-PollMs` при запуске из исходника |
-| После перезапуска OpenCode тишина | Утилита переподключится сама; если нет — нажмите **ПОВТОРИТЬ** |
-
-Лог лежит рядом с настройками: `%APPDATA%\OpenCodeAutoContinue\auto-continue.log`
-(старый — `auto-continue.log.1`).
-
-## 📄 Лицензия
-
-Проект распространяется по лицензии [MIT](LICENSE).
-
-<p align="center">
-  <sub>Сделано для личного workflow с <a href="https://opencode.ai">OpenCode</a> · Windows 10/11 · PowerShell 5.1</sub>
-</p>
+[MIT](LICENSE)
