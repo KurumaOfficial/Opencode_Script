@@ -8,15 +8,10 @@
 
 A small Windows utility that keeps [OpenCode](https://opencode.ai) sessions going. When the assistant finishes a response, the tool sends a preset message to that session, so a long task does not stall while it waits for you to type "continue".
 
-<!--
-Screenshots: save real captures as docs/screenshot-main.png and
-docs/screenshot-settings.png, then uncomment this block.
-
 <p>
   <img src="docs/screenshot-main.png" width="360" alt="Main window">
   <img src="docs/screenshot-settings.png" width="360" alt="Settings and log">
 </p>
--->
 
 ## What it does
 
