@@ -5,11 +5,12 @@
     Следит за чатами OpenCode и после каждого завершённого ответа бота
     автоматически отправляет ему заданный текст ("Продолжай разработку").
 
+    - Работа разбита на вкладки: у каждой свой текст, свои чаты, свой лимит и своё состояние.
     - Список чатов живёт по sessionId, поэтому переименование чата ничего не ломает.
-    - Новые активные чаты можно подхватывать автоматически (в настройках, по умолчанию выкл).
-    - Текст сообщения и список чатов настраиваются прямо в окне и сохраняются
+    - Новые активные чаты можно подхватывать автоматически (в настройках вкладки, по умолчанию выкл).
+    - Вкладки, тексты и чаты настраиваются прямо в окне и сохраняются
       в settings.json (у .exe — в %APPDATA%\OpenCodeAutoContinue).
-    - Лимит запуска: по количеству итераций или до заданного времени.
+    - Лимит запуска у каждой вкладки: по количеству итераций или до заданного времени.
     - Ошибки не заливают журнал: повторы с паузой, авто-стоп и переподключение.
 
     Запуск: Запустить.cmd  (или powershell -ExecutionPolicy Bypass -File AutoContinue.ps1)
@@ -22,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4.0'
+$script:AppVersion = '1.5.0'
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -175,17 +176,100 @@ function Invoke-OcApi {
 
 # --------------------------------------------------------------- settings ----
 
+$script:MaxTabs = 10
+
+function New-TabId { return 'tab_' + ([guid]::NewGuid().ToString('N').Substring(0, 8)) }
+
+function New-ChatObject([string]$id, [string]$title) {
+    return [hashtable]::Synchronized(@{
+            Id         = $id
+            Title      = $title
+            Phase      = 'waiting'
+            Status     = 'ожидание ответа'
+            Count      = 0
+            SentAt     = [datetime]::MinValue
+            NextTryAt  = [datetime]::MinValue
+            FailStreak = 0
+            NoAnswer   = 0
+            LastError  = ''
+        })
+}
+
+# Вкладка — самостоятельная задача: свой текст, свои чаты, свой лимит и своё состояние.
+function New-TabObject($cfg, [bool]$forcePause = $false) {
+    $chats = @()
+    foreach ($c in @($cfg.chats)) {
+        if ($null -ne $c) { $chats += , (New-ChatObject ([string]$c.Id) ([string]$c.Title)) }
+    }
+    $paused = [bool]$cfg.paused
+    $stopped = $paused -or $forcePause
+    return [hashtable]::Synchronized(@{
+            Id          = [string]$cfg.id
+            Name        = [string]$cfg.name
+            Message     = [string]$cfg.message
+            AutoAdd     = [bool]$cfg.autoAdd
+            Chats       = $chats
+            Stop        = $stopped
+            StopReason  = $(if ($stopped) { 'user' } else { '' })
+            UserPaused  = $paused
+            LimitMode   = [string]$cfg.limitMode
+            LimitCount  = [int]$cfg.limitCount
+            LimitTime   = [string]$cfg.limitTime
+            DeadlineTicks = [long]0
+            LimitSince  = [datetime]::MinValue
+            LimitHit    = ''
+            SentThisRun = 0
+            RunStartedAt = $(if ($stopped) { [datetime]::MinValue } else { Get-Date })
+            Deleted     = $false
+            UiKey       = ''
+        })
+}
+
+# После паузы чат в фазе «отправлено» возвращается в ожидание: если бот свободен,
+# сообщение уйдёт сразу, а не после 45-секундного таймаута «ответ не начался».
+function Reset-TabChatsForResume($tab) {
+    foreach ($c in @($tab.Chats)) {
+        if ([string]$c.Phase -eq 'sent') {
+            $c.Phase = 'waiting'
+            $c.Status = 'ожидание ответа'
+            $c.NoAnswer = 0
+        }
+    }
+}
+
+function Read-TabConfig($src, [bool]$trustAutoAdd) {
+    $t = @{
+        id = ''; name = ''; message = $null; autoAdd = $false; paused = $false
+        chats = @(); limitMode = 'none'; limitCount = 50; limitTime = '18:00'
+    }
+    if ($null -ne $src.id) { $t.id = [string]$src.id }
+    if ($null -ne $src.name) { $t.name = ([string]$src.name).Trim() }
+    if ($null -ne $src.message) { $t.message = [string]$src.message }
+    if ($trustAutoAdd -and $null -ne $src.autoAdd) { $t.autoAdd = [bool]$src.autoAdd }
+    if ($null -ne $src.paused) { $t.paused = [bool]$src.paused }
+    if ($src.chats) {
+        $t.chats = @($src.chats | ForEach-Object { @{ Id = [string]$_.id; Title = [string]$_.title } })
+    }
+    if ([string]$src.limitMode -in @('none', 'count', 'time')) { $t.limitMode = [string]$src.limitMode }
+    if ($null -ne $src.limitCount) {
+        $n = 0
+        if ([int]::TryParse([string]$src.limitCount, [ref]$n) -and $n -ge 1 -and $n -le 99999) { $t.limitCount = $n }
+    }
+    if ([string]$src.limitTime -match '^(\d{1,2}):(\d{2})$') {
+        $h = [int]$Matches[1]
+        $m = [int]$Matches[2]
+        if ($h -ge 0 -and $h -le 23 -and $m -ge 0 -and $m -le 59) { $t.limitTime = ('{0:00}:{1:00}' -f $h, $m) }
+    }
+    return $t
+}
+
 $settings = @{
-    message    = $MessageText
-    autoAdd    = $false
-    chats      = @()
-    ignored    = @()
-    limitMode  = 'none'
-    limitCount = 50
-    limitTime  = '18:00'
-    topmost    = $true
-    winWidth   = 400
-    winHeight  = 520
+    ignored   = @()
+    topmost   = $true
+    winWidth  = 400
+    winHeight = 540
+    activeTab = ''
+    tabs      = @()
 }
 
 if (Test-Path -LiteralPath $script:SettingsPath) {
@@ -194,57 +278,79 @@ if (Test-Path -LiteralPath $script:SettingsPath) {
         $raw = $rawText | ConvertFrom-Json
         $schema = 0
         if ($null -ne $raw.schema) { [void][int]::TryParse([string]$raw.schema, [ref]$schema) }
-        if ($null -ne $raw.message) { $settings.message = [string]$raw.message }
-        # до схемы 2 автодобавление включалось по умолчанию, а не выбором пользователя —
-        # новый интерфейс стартует с выключенным
-        if ($schema -ge 2 -and $null -ne $raw.autoAdd) { $settings.autoAdd = [bool]$raw.autoAdd }
-        if ($raw.chats) {
-            $settings.chats = @($raw.chats | ForEach-Object {
-                    @{ Id = [string]$_.id; Title = [string]$_.title }
-                })
-        }
+
         if ($raw.ignored) { $settings.ignored = @($raw.ignored | ForEach-Object { [string]$_ }) }
-        if ([string]$raw.limitMode -in @('none', 'count', 'time')) { $settings.limitMode = [string]$raw.limitMode }
-        if ($null -ne $raw.limitCount) {
-            $n = 0
-            if ([int]::TryParse([string]$raw.limitCount, [ref]$n) -and $n -ge 1 -and $n -le 99999) { $settings.limitCount = $n }
-        }
-        if ([string]$raw.limitTime -match '^(\d{1,2}):(\d{2})$') {
-            $h = [int]$Matches[1]
-            $m = [int]$Matches[2]
-            if ($h -ge 0 -and $h -le 23 -and $m -ge 0 -and $m -le 59) {
-                $settings.limitTime = ('{0:00}:{1:00}' -f $h, $m)
-            }
-        }
         if ($null -ne $raw.topmost) { $settings.topmost = [bool]$raw.topmost }
-        # размеры окна старого интерфейса (860x880) в новый не переносим
+        # размеры окна интерфейса 1.3 (860x880) не переносим
         if ($schema -ge 2 -and $null -ne $raw.winWidth) { $settings.winWidth = [int]$raw.winWidth }
         if ($schema -ge 2 -and $null -ne $raw.winHeight) { $settings.winHeight = [int]$raw.winHeight }
+
+        if ($schema -ge 3 -and $raw.tabs) {
+            foreach ($t in @($raw.tabs)) { $settings.tabs += , (Read-TabConfig $t $true) }
+            if ($null -ne $raw.activeTab) { $settings.activeTab = [string]$raw.activeTab }
+        }
+        else {
+            # схемы 0-2 хранили одну задачу в корне файла — она становится первой вкладкой
+            # (до схемы 2 автодобавление включалось по умолчанию, а не выбором пользователя)
+            $legacy = Read-TabConfig $raw ($schema -ge 2)
+            $legacy.name = 'Задача 1'
+            $settings.tabs = @($legacy)
+        }
     }
     catch { }
 }
 elseif ($ChatTitles.Count -gt 0) {
-    $settings.chats = @($ChatTitles | ForEach-Object { @{ Id = ''; Title = [string]$_ } })
+    $first = Read-TabConfig @{} $false
+    $first.chats = @($ChatTitles | ForEach-Object { @{ Id = ''; Title = [string]$_ } })
+    $settings.tabs = @($first)
 }
 
+# приводим вкладки в порядок: хотя бы одна, уникальные id, имена, предел количества
+if (@($settings.tabs).Count -eq 0) { $settings.tabs = @(Read-TabConfig @{} $false) }
+$settings.tabs = @($settings.tabs | Select-Object -First $script:MaxTabs)
+$usedIds = @{}
+$tabNo = 0
+foreach ($t in $settings.tabs) {
+    $tabNo++
+    if (-not $t.id -or $usedIds.ContainsKey([string]$t.id)) { $t.id = New-TabId }
+    $usedIds[[string]$t.id] = $true
+    if (-not $t.name) { $t.name = 'Задача ' + $tabNo }
+    if ($null -eq $t.message) { $t.message = $MessageText }
+}
+if (-not $usedIds.ContainsKey([string]$settings.activeTab)) { $settings.activeTab = [string]$settings.tabs[0].id }
+
 $script:Dirty = $false
+$script:ActiveTab = $null
 
 function Save-Settings {
     try {
-        $payload = @{
-            schema     = 2
-            message    = [string]$state.Message
-            autoAdd    = [bool]$state.AutoAdd
-            chats      = @($state.Chats | ForEach-Object { @{ id = [string]$_.Id; title = [string]$_.Title } })
-            ignored    = @($state.Ignored.Keys)
-            limitMode  = [string]$state.LimitMode
-            limitCount = [int]$state.LimitCount
-            limitTime  = [string]$state.LimitTime
-            topmost    = [bool]$settings.topmost
-            winWidth   = [int]$settings.winWidth
-            winHeight  = [int]$settings.winHeight
+        if ($null -eq $script:ActiveTab) { return }
+        $tabsOut = @()
+        foreach ($t in @($state.Tabs)) {
+            $chatsOut = @()
+            foreach ($c in @($t.Chats)) { $chatsOut += , @{ id = [string]$c.Id; title = [string]$c.Title } }
+            $tabsOut += , @{
+                id         = [string]$t.Id
+                name       = [string]$t.Name
+                message    = [string]$t.Message
+                autoAdd    = [bool]$t.AutoAdd
+                paused     = [bool]$t.UserPaused
+                limitMode  = [string]$t.LimitMode
+                limitCount = [int]$t.LimitCount
+                limitTime  = [string]$t.LimitTime
+                chats      = $chatsOut
+            }
         }
-        $json = $payload | ConvertTo-Json -Depth 6
+        $payload = @{
+            schema    = 3
+            activeTab = [string]$script:ActiveTab.Id
+            tabs      = $tabsOut
+            ignored   = @($state.Ignored.Keys)
+            topmost   = [bool]$settings.topmost
+            winWidth  = [int]$settings.winWidth
+            winHeight = [int]$settings.winHeight
+        }
+        $json = $payload | ConvertTo-Json -Depth 8
         [IO.File]::WriteAllText($script:SettingsPath, $json, (New-Object Text.UTF8Encoding($true)))
         $script:Dirty = $false
     }
@@ -257,50 +363,22 @@ $state = [hashtable]::Synchronized(@{})
 $state.BaseUrl = $script:BaseUrl
 $state.Auth = $script:Auth
 $state.ServiceVersion = $script:ServiceVersion
-$state.Message = [string]$settings.message
-$state.AutoAdd = [bool]$settings.autoAdd
 $state.PollMs = [Math]::Max(500, $PollMs)
-$state.Stop = [bool]$StartStopped
-$state.StopReason = if ($StartStopped) { 'user' } else { '' }
-$state.LimitMode = [string]$settings.limitMode
-$state.LimitCount = [int]$settings.limitCount
-$state.LimitTime = [string]$settings.limitTime
-$state.DeadlineTicks = [long]0
-$state.LimitSince = [datetime]::MinValue
-$state.LimitHit = ''
-$state.SentThisRun = 0
 $state.SentTotal = 0
 $state.ErrorTotal = 0
 $state.ErrorStreak = 0
-$state.RunStartedAt = if ($StartStopped) { [datetime]::MinValue } else { Get-Date }
 $state.StartedAt = Get-Date
 $state.ApiError = ''
+$state.Shutdown = $false
 $state.Log = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $state.AddQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[hashtable]'
 $state.RemoveQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $state.Ignored = [hashtable]::Synchronized(@{})
-$state.Chats = @()
-$state.SeedChats = @()
-
 foreach ($ig in $settings.ignored) { if ($ig) { $state.Ignored[$ig] = $true } }
 
-$seed = @()
-foreach ($c in $settings.chats) {
-    $seed += , ([hashtable]::Synchronized(@{
-                Id         = [string]$c.Id
-                Title      = [string]$c.Title
-                Phase      = 'waiting'
-                Status     = 'ожидание ответа'
-                Count      = 0
-                SentAt     = [datetime]::MinValue
-                NextTryAt  = [datetime]::MinValue
-                FailStreak = 0
-                NoAnswer   = 0
-                LastError  = ''
-            }))
-}
-$state.SeedChats = $seed
-$state.Chats = $seed
+$builtTabs = @()
+foreach ($cfg in $settings.tabs) { $builtTabs += , (New-TabObject $cfg ([bool]$StartStopped)) }
+$state.Tabs = $builtTabs
 
 # ----------------------------------------------------------------- worker ----
 
@@ -317,7 +395,7 @@ function API {
     $req.Headers['Authorization'] = 'Basic ' + $state.Auth
     $req.Timeout = $Timeout
     $req.ReadWriteTimeout = $Timeout
-    $req.UserAgent = 'OpenCode-AutoContinue/1.4'
+    $req.UserAgent = 'OpenCode-AutoContinue/1.5'
     $req.KeepAlive = $false
 
     if ($null -ne $Body) {
@@ -362,6 +440,17 @@ function Chat-Name($chat) {
     return [string]$chat.Id
 }
 
+# с одной вкладкой журнал выглядит как раньше, с несколькими — с именем вкладки
+function Chat-Label($tab, $chat) {
+    if (@($state.Tabs).Count -gt 1) { return '[' + [string]$tab.Name + ' · ' + (Chat-Name $chat) + ']' }
+    return '[' + (Chat-Name $chat) + ']'
+}
+
+function Tab-Label($tab) {
+    if (@($state.Tabs).Count -gt 1) { return '«' + [string]$tab.Name + '»: ' }
+    return ''
+}
+
 function Reload-Service {
     $paths = @(
         (Join-Path $env:USERPROFILE '.local\state\opencode\service.json'),
@@ -388,26 +477,33 @@ function Reload-Service {
     return $false
 }
 
-$chats = New-Object System.Collections.ArrayList
-foreach ($c in @($state.SeedChats)) { [void]$chats.Add($c) }
-foreach ($c in $chats) {
-    if ($c.Phase -eq 'init') {
-        $c.Phase = 'waiting'
-        $c.Status = 'ожидание ответа'
-    }
-}
-$state.Chats = @($chats)
-
-function Sync-Chats { $state.Chats = @($chats) }
+# ---- вкладки и чаты ----
+# Чат принадлежит ровно одной вкладке. Список чатов вкладки меняет только воркер,
+# интерфейс отправляет команды через очереди.
 
 function Find-Chat([string]$id) {
-    foreach ($c in $chats) { if ($c.Id -eq $id) { return $c } }
+    foreach ($t in @($state.Tabs)) {
+        foreach ($c in @($t.Chats)) {
+            if ([string]$c.Id -eq $id) { return @{ Tab = $t; Chat = $c } }
+        }
+    }
     return $null
 }
 
-function Add-Chat([string]$id, [string]$title, [string]$reason) {
+function Find-Tab([string]$id) {
+    foreach ($t in @($state.Tabs)) { if ([string]$t.Id -eq $id) { return $t } }
+    return $null
+}
+
+function Add-Chat($tab, [string]$id, [string]$title, [string]$reason) {
     if (-not $id) { return }
-    if ($null -ne (Find-Chat $id)) { return }
+    $existing = Find-Chat $id
+    if ($null -ne $existing) {
+        if ($reason -eq 'добавлен вручную' -and [string]$existing.Tab.Id -ne [string]$tab.Id) {
+            Log 'warn' ('Чат «' + $(if ($title) { $title } else { $id }) + '» уже в вкладке «' + [string]$existing.Tab.Name + '» — пропускаю')
+        }
+        return
+    }
     $chat = [hashtable]::Synchronized(@{
             Id         = $id
             Title      = $title
@@ -420,20 +516,18 @@ function Add-Chat([string]$id, [string]$title, [string]$reason) {
             NoAnswer   = 0
             LastError  = ''
         })
-    [void]$chats.Add($chat)
-    Sync-Chats
+    $tab.Chats = @($tab.Chats) + , $chat
     $name = if ($title) { $title } else { $id }
-    Log 'info' ('+ добавлен чат «' + $name + '»' + $(if ($reason) { ' — ' + $reason } else { '' }))
+    Log 'info' ((Tab-Label $tab) + '+ добавлен чат «' + $name + '»' + $(if ($reason) { ' — ' + $reason } else { '' }))
 }
 
 function Remove-Chat([string]$id, [string]$why) {
-    for ($i = $chats.Count - 1; $i -ge 0; $i--) {
-        if ($chats[$i].Id -eq $id) {
-            $name = Chat-Name $chats[$i]
-            $chats.RemoveAt($i)
-            Sync-Chats
-            Log 'info' ('− убран чат «' + $name + '»' + $(if ($why) { ' — ' + $why } else { '' }))
-        }
+    foreach ($t in @($state.Tabs)) {
+        $hit = @($t.Chats | Where-Object { [string]$_.Id -eq $id })
+        if ($hit.Count -eq 0) { continue }
+        $name = Chat-Name $hit[0]
+        $t.Chats = @($t.Chats | Where-Object { [string]$_.Id -ne $id })
+        Log 'info' ((Tab-Label $t) + '− убран чат «' + $name + '»' + $(if ($why) { ' — ' + $why } else { '' }))
     }
 }
 
@@ -459,8 +553,32 @@ function Resolve-Chat($chat) {
     }
 }
 
-function Send-Chat($chat) {
-    if ([string]::IsNullOrWhiteSpace([string]$state.Message)) {
+# потеря связи или отказ в доступе касаются сервиса целиком, поэтому паузятся все работающие вкладки
+function Pause-Running-Tabs([string]$reason) {
+    foreach ($t in @($state.Tabs)) {
+        if (-not $t.Stop) {
+            $t.Stop = $true
+            $t.StopReason = $reason
+            $t.LimitHit = ''
+        }
+    }
+}
+
+function Resume-Tab($tab) {
+    foreach ($c in @($tab.Chats)) {
+        if ([string]$c.Phase -eq 'sent') {
+            $c.Phase = 'waiting'
+            $c.Status = 'ожидание ответа'
+            $c.NoAnswer = 0
+        }
+    }
+    $tab.Stop = $false
+    $tab.StopReason = ''
+}
+
+function Send-Chat($tab, $chat) {
+    $text = [string]$tab.Message
+    if ([string]::IsNullOrWhiteSpace($text)) {
         $chat.Phase = 'waiting'
         $chat.Status = 'пустой текст сообщения'
         return
@@ -468,9 +586,9 @@ function Send-Chat($chat) {
     if ($chat.NextTryAt -and (Get-Date) -lt [datetime]$chat.NextTryAt) { return }
 
     try {
-        $null = API 'POST' ("/api/session/" + $chat.Id + "/prompt") @{ text = [string]$state.Message; delivery = 'queue' }
+        $null = API 'POST' ("/api/session/" + $chat.Id + "/prompt") @{ text = $text; delivery = 'queue' }
         $chat.Count = [int]$chat.Count + 1
-        $state.SentThisRun = [int]$state.SentThisRun + 1
+        $tab.SentThisRun = [int]$tab.SentThisRun + 1
         $state.SentTotal = [int]$state.SentTotal + 1
         $chat.SentAt = Get-Date
         $chat.Phase = 'sent'
@@ -478,20 +596,20 @@ function Send-Chat($chat) {
         $chat.FailStreak = 0
         $chat.LastError = ''
         $chat.NextTryAt = [datetime]::MinValue
-        Log 'info' ('[' + (Chat-Name $chat) + '] → ' + $state.Message + '  (#' + $chat.Count + ')')
+        $preview = ($text -replace '\s+', ' ').Trim()
+        if ($preview.Length -gt 90) { $preview = $preview.Substring(0, 90) + '…' }
+        Log 'info' ((Chat-Label $tab $chat) + ' → ' + $preview + '  (#' + $chat.Count + ')')
     }
     catch {
         $msg = [string]$_.Exception.Message
         $state.ErrorTotal = [int]$state.ErrorTotal + 1
         if ($msg -match '^HTTP 404') {
-            Log 'warn' ('[' + (Chat-Name $chat) + '] сессия не найдена — убираю из списка')
+            Log 'warn' ((Chat-Label $tab $chat) + ' сессия не найдена — убираю из списка')
             Remove-Chat $chat.Id 'сессия удалена'
             return
         }
         if ($msg -match '^HTTP 40[13]') {
-            $state.Stop = $true
-            $state.StopReason = 'error'
-            $state.LimitHit = ''
+            Pause-Running-Tabs 'error'
             Log 'err' ('Нет доступа к API OpenCode: ' + $msg + ' — пауза')
             return
         }
@@ -504,24 +622,24 @@ function Send-Chat($chat) {
             $chat.Phase = 'blocked'
             $chat.Status = 'ошибка — чат на паузе'
             $chat.NextTryAt = [datetime]::MinValue
-            Log 'err' ('[' + (Chat-Name $chat) + '] ' + $chat.FailStreak + ' ошибок подряд — чат поставлен на паузу: ' + $msg)
+            Log 'err' ((Chat-Label $tab $chat) + ' ' + $chat.FailStreak + ' ошибок подряд — чат поставлен на паузу: ' + $msg)
         }
         else {
             $chat.Phase = 'waiting'
             $chat.Status = 'ошибка отправки — повтор'
             $chat.NextTryAt = (Get-Date).AddSeconds($wait)
-            Log 'err' ('[' + (Chat-Name $chat) + '] ошибка отправки (' + $chat.FailStreak + '/5): ' + $msg + ' — повтор через ' + $wait + ' с')
+            Log 'err' ((Chat-Label $tab $chat) + ' ошибка отправки (' + $chat.FailStreak + '/5): ' + $msg + ' — повтор через ' + $wait + ' с')
         }
     }
 }
 
-function Limit-Reason {
-    if ($state.LimitMode -eq 'count') {
-        $limit = [int]$state.LimitCount
-        if ($limit -gt 0 -and [int]$state.SentThisRun -ge $limit) { return 'count' }
+function Limit-Reason($tab) {
+    if ($tab.LimitMode -eq 'count') {
+        $limit = [int]$tab.LimitCount
+        if ($limit -gt 0 -and [int]$tab.SentThisRun -ge $limit) { return 'count' }
     }
-    elseif ($state.LimitMode -eq 'time') {
-        $ticks = [long]$state.DeadlineTicks
+    elseif ($tab.LimitMode -eq 'time') {
+        $ticks = [long]$tab.DeadlineTicks
         if ($ticks -gt 0 -and (Get-Date).Ticks -ge $ticks) { return 'time' }
     }
     return ''
@@ -540,24 +658,31 @@ Log 'info' ('Наблюдатель запущен · интервал ' + $stat
 
 while ($true) {
     try {
+        if ($state.Shutdown) { break }
+
         # команды из интерфейса
         $item = $null
         while ($state.RemoveQueue.TryDequeue([ref]$item)) { Remove-Chat ([string]$item) '' }
         while ($state.AddQueue.TryDequeue([ref]$item)) {
+            $target = Find-Tab ([string]$item.TabId)
+            if ($null -eq $target) { continue }
             $state.Ignored.Remove([string]$item.Id)
-            Add-Chat ([string]$item.Id) ([string]$item.Title) 'добавлен вручную'
+            Add-Chat $target ([string]$item.Id) ([string]$item.Title) 'добавлен вручную'
         }
 
-        if ($state.Stop) {
-            # после потери связи quietly проверяем, не вернулся ли OpenCode
-            if ($state.StopReason -eq 'error' -and (Get-Date) -ge $nextHealth) {
+        $tabs = @($state.Tabs | Where-Object { -not $_.Deleted })
+        $live = @($tabs | Where-Object { -not $_.Stop })
+
+        if ($live.Count -eq 0) {
+            # все вкладки на паузе. Если причина — потеря связи, тихо проверяем, не вернулся ли OpenCode
+            $errTabs = @($tabs | Where-Object { [string]$_.StopReason -eq 'error' })
+            if ($errTabs.Count -gt 0 -and (Get-Date) -ge $nextHealth) {
                 if (Reload-Service) { Log 'info' 'Подхвачены новые параметры сервера OpenCode' }
                 try {
                     $null = API 'GET' '/api/session/active' $null 6000
                     $healthOk++
                     if ($healthOk -ge 2) {
-                        $state.Stop = $false
-                        $state.StopReason = ''
+                        foreach ($t in $errTabs) { Resume-Tab $t }
                         $state.ApiError = ''
                         $apiFail = 0
                         $lastApiErr = ''
@@ -574,26 +699,30 @@ while ($true) {
             continue
         }
 
-        # лимит запуска
-        $whyLimit = Limit-Reason
-        if ($whyLimit) {
-            $state.Stop = $true
-            $state.StopReason = 'limit'
-            $state.LimitHit = $whyLimit
+        # лимиты запуска — у каждой вкладки свои
+        foreach ($t in $live) {
+            $whyLimit = Limit-Reason $t
+            if (-not $whyLimit) { continue }
+            $t.Stop = $true
+            $t.StopReason = 'limit'
+            $t.LimitHit = $whyLimit
             if ($whyLimit -eq 'count') {
-                Log 'ok' ('Лимит итераций достигнут: ' + $state.SentThisRun + ' из ' + $state.LimitCount + ' — пауза')
+                Log 'ok' ((Tab-Label $t) + 'лимит итераций достигнут: ' + $t.SentThisRun + ' из ' + $t.LimitCount + ' — пауза')
             }
             else {
-                $deadline = [datetime]::new([long]$state.DeadlineTicks)
-                Log 'ok' ('Лимит времени достигнут (' + $deadline.ToString('HH:mm') + ') — пауза')
+                $deadline = [datetime]::new([long]$t.DeadlineTicks)
+                Log 'ok' ((Tab-Label $t) + 'лимит времени достигнут (' + $deadline.ToString('HH:mm') + ') — пауза')
             }
-            continue
         }
+        $live = @($live | Where-Object { -not $_.Stop })
+        if ($live.Count -eq 0) { continue }
 
         # восстановление чатов, заданных названием
         if (((Get-Date) - $lastResolve).TotalSeconds -gt 10) {
-            foreach ($c in $chats.ToArray()) {
-                if (-not $c.Id) { [void](Resolve-Chat $c) }
+            foreach ($t in $tabs) {
+                foreach ($c in @($t.Chats)) {
+                    if (-not $c.Id) { [void](Resolve-Chat $c) }
+                }
             }
             $lastResolve = Get-Date
         }
@@ -607,6 +736,10 @@ while ($true) {
                 $lastApiErr = ''
             }
             $state.ApiError = ''
+            # связь есть: вкладки, которые остановила ошибка, продолжают работу
+            foreach ($t in $tabs) {
+                if ($t.Stop -and [string]$t.StopReason -eq 'error') { Resume-Tab $t }
+            }
             if ($act -and $act.data) {
                 foreach ($prop in $act.data.PSObject.Properties) { $running[[string]$prop.Name] = $true }
             }
@@ -630,14 +763,9 @@ while ($true) {
                 Log 'err' ($prefix + $msg)
                 $lastApiErr = $msg
             }
-            elseif ($apiFail % 5 -eq 0) {
-                Log 'warn' ('OpenCode не отвечает — попытка ' + $apiFail)
-            }
 
             if ($apiFail -ge 5) {
-                $state.Stop = $true
-                $state.StopReason = 'error'
-                $state.LimitHit = ''
+                Pause-Running-Tabs 'error'
                 $healthOk = 0
                 $nextHealth = (Get-Date).AddSeconds(8)
                 Log 'err' 'Слишком много ошибок подряд — автопродолжение приостановлено, проверяю связь в фоне'
@@ -649,8 +777,10 @@ while ($true) {
             continue
         }
 
-        # авто-подхват активных чатов
-        if ($state.AutoAdd) {
+        # авто-подхват активных чатов — только во вкладку с включённым автодобавлением
+        $addTab = $null
+        foreach ($t in $live) { if ($t.AutoAdd) { $addTab = $t; break } }
+        if ($null -ne $addTab) {
             foreach ($id in @($running.Keys)) {
                 if ($null -ne (Find-Chat $id)) { continue }
                 if ($state.Ignored.ContainsKey($id)) { continue }
@@ -672,72 +802,74 @@ while ($true) {
                 if ($info.parentID) { continue }
                 if ($info.archived) { continue }
 
-                Add-Chat $id ([string]$info.title) 'активный чат'
+                Add-Chat $addTab $id ([string]$info.title) 'активный чат'
             }
             if ($infoCache.Count -gt 400) { $infoCache = @{}; $infoRetry = @{} }
         }
 
-        foreach ($chat in $chats.ToArray()) {
-            if ($state.Stop) { break }
-            if (Limit-Reason) { break }
-            if (-not $chat.Id) { continue }
+        foreach ($tab in $live) {
+            foreach ($chat in @($tab.Chats)) {
+                if ($tab.Stop -or $tab.Deleted) { break }
+                if (Limit-Reason $tab) { break }
+                if (-not $chat.Id) { continue }
 
-            $busy = $running.ContainsKey([string]$chat.Id)
-            $phase = [string]$chat.Phase
+                $busy = $running.ContainsKey([string]$chat.Id)
+                $phase = [string]$chat.Phase
 
-            if ($phase -eq 'waiting') {
-                if ($busy) {
-                    $chat.Phase = 'running'
-                    $chat.Status = 'печатает…'
-                    $chat.NoAnswer = 0
+                if ($phase -eq 'waiting') {
+                    if ($busy) {
+                        $chat.Phase = 'running'
+                        $chat.Status = 'печатает…'
+                        $chat.NoAnswer = 0
+                    }
+                    elseif (-not $chat.NextTryAt -or (Get-Date) -ge [datetime]$chat.NextTryAt) {
+                        Send-Chat $tab $chat
+                    }
                 }
-                elseif (-not $chat.NextTryAt -or (Get-Date) -ge [datetime]$chat.NextTryAt) {
-                    Send-Chat $chat
-                }
-            }
-            elseif ($phase -eq 'sent') {
-                if ($busy) {
-                    $chat.Phase = 'running'
-                    $chat.Status = 'печатает…'
-                    $chat.NoAnswer = 0
-                }
-                else {
-                    $age = ((Get-Date) - [datetime]$chat.SentAt).TotalSeconds
-                    if ($age -gt 45) {
-                        $chat.NoAnswer = [int]$chat.NoAnswer + 1
-                        if ($chat.NoAnswer -ge 3) {
-                            $chat.Phase = 'blocked'
-                            $chat.Status = 'бот не отвечает'
-                            Log 'err' ('[' + (Chat-Name $chat) + '] ответ не начался 3 раза — чат на паузе')
-                        }
-                        else {
-                            $chat.Phase = 'waiting'
-                            $chat.Status = 'ответ не начался — повтор'
-                            $chat.NextTryAt = (Get-Date).AddSeconds(10)
-                            Log 'warn' ('[' + (Chat-Name $chat) + '] ответ не начался за 45 с — повторная отправка')
+                elseif ($phase -eq 'sent') {
+                    if ($busy) {
+                        $chat.Phase = 'running'
+                        $chat.Status = 'печатает…'
+                        $chat.NoAnswer = 0
+                    }
+                    else {
+                        $age = ((Get-Date) - [datetime]$chat.SentAt).TotalSeconds
+                        if ($age -gt 45) {
+                            $chat.NoAnswer = [int]$chat.NoAnswer + 1
+                            if ($chat.NoAnswer -ge 3) {
+                                $chat.Phase = 'blocked'
+                                $chat.Status = 'бот не отвечает'
+                                Log 'err' ((Chat-Label $tab $chat) + ' ответ не начался 3 раза — чат на паузе')
+                            }
+                            else {
+                                $chat.Phase = 'waiting'
+                                $chat.Status = 'ответ не начался — повтор'
+                                $chat.NextTryAt = (Get-Date).AddSeconds(10)
+                                Log 'warn' ((Chat-Label $tab $chat) + ' ответ не начался за 45 с — повторная отправка')
+                            }
                         }
                     }
                 }
-            }
-            elseif ($phase -eq 'running') {
-                if (-not $busy) {
+                elseif ($phase -eq 'running') {
+                    if (-not $busy) {
+                        $chat.Phase = 'waiting'
+                        $chat.Status = 'ответ получен, ждём отправки'
+                        Log 'info' ((Chat-Label $tab $chat) + ' ответ завершён')
+                    }
+                }
+                elseif ($phase -eq 'blocked') {
+                    if ($busy) {
+                        $chat.Phase = 'running'
+                        $chat.Status = 'печатает…'
+                        $chat.FailStreak = 0
+                        $chat.NoAnswer = 0
+                        Log 'ok' ((Chat-Label $tab $chat) + ' бот снова работает')
+                    }
+                }
+                else {
                     $chat.Phase = 'waiting'
-                    $chat.Status = 'ответ получен, ждём отправки'
-                    Log 'info' ('[' + (Chat-Name $chat) + '] ответ завершён')
+                    $chat.Status = 'ожидание ответа'
                 }
-            }
-            elseif ($phase -eq 'blocked') {
-                if ($busy) {
-                    $chat.Phase = 'running'
-                    $chat.Status = 'печатает…'
-                    $chat.FailStreak = 0
-                    $chat.NoAnswer = 0
-                    Log 'ok' ('[' + (Chat-Name $chat) + '] бот снова работает')
-                }
-            }
-            else {
-                $chat.Phase = 'waiting'
-                $chat.Status = 'ожидание ответа'
             }
         }
 
@@ -767,7 +899,7 @@ $uiXaml = @'
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="OpenCode AutoContinue"
-        Width="400" Height="520" MinWidth="360" MinHeight="440"
+        Width="400" Height="540" MinWidth="360" MinHeight="480"
         WindowStyle="None" ResizeMode="CanResize"
         WindowStartupLocation="CenterScreen"
         Background="#0A0A0A" Foreground="#EEEEEE"
@@ -882,6 +1014,11 @@ $uiXaml = @'
           </ControlTemplate>
         </Setter.Value>
       </Setter>
+      <Style.Triggers>
+        <Trigger Property="IsEnabled" Value="False">
+          <Setter Property="Opacity" Value="0.35"/>
+        </Trigger>
+      </Style.Triggers>
     </Style>
 
     <Style x:Key="IconButton" TargetType="Button">
@@ -911,6 +1048,11 @@ $uiXaml = @'
           </ControlTemplate>
         </Setter.Value>
       </Setter>
+      <Style.Triggers>
+        <Trigger Property="IsEnabled" Value="False">
+          <Setter Property="Opacity" Value="0.35"/>
+        </Trigger>
+      </Style.Triggers>
     </Style>
 
     <Style x:Key="CloseButton" TargetType="Button" BasedOn="{StaticResource IconButton}">
@@ -1100,6 +1242,7 @@ $uiXaml = @'
     <Grid>
       <Grid.RowDefinitions>
         <RowDefinition Height="36"/>
+        <RowDefinition Height="32"/>
         <RowDefinition Height="*"/>
       </Grid.RowDefinitions>
 
@@ -1127,8 +1270,24 @@ $uiXaml = @'
         </StackPanel>
       </Grid>
 
+      <!-- ===== tabs ===== -->
+      <Border Grid.Row="1" BorderBrush="#282828" BorderThickness="0,0,0,1" IsHitTestVisible="False"/>
+      <Grid x:Name="TabRow" Grid.Row="1" Margin="10,0,8,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <ScrollViewer x:Name="TabScroll" Height="30" VerticalAlignment="Bottom" Focusable="False"
+                      HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
+          <StackPanel x:Name="TabPanel" Orientation="Horizontal"/>
+        </ScrollViewer>
+        <Button x:Name="NewTabBtn" Grid.Column="1" Style="{StaticResource IconButton}" Width="28" Height="26"
+                HorizontalAlignment="Left" VerticalAlignment="Center" Margin="4,0,0,0"
+                Content="&#xE710;" ToolTip="Новая вкладка (Ctrl+T)"/>
+      </Grid>
+
       <!-- ===== main view ===== -->
-      <Grid x:Name="MainView" Grid.Row="1" Margin="14,4,14,14">
+      <Grid x:Name="MainView" Grid.Row="2" Margin="14,8,14,14">
         <Grid.RowDefinitions>
           <RowDefinition Height="*" MinHeight="80"/>
           <RowDefinition Height="Auto"/>
@@ -1221,8 +1380,9 @@ $uiXaml = @'
       </Grid>
 
       <!-- ===== settings view ===== -->
-      <Grid x:Name="SettingsView" Grid.Row="1" Margin="14,4,14,12" Visibility="Collapsed">
+      <Grid x:Name="SettingsView" Grid.Row="2" Margin="14,8,14,12" Visibility="Collapsed">
         <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
@@ -1241,25 +1401,44 @@ $uiXaml = @'
           <TextBlock Text="НАСТРОЙКИ" Style="{StaticResource SectionLabel}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
         </Grid>
 
-        <Border Grid.Row="1" Background="#141414" BorderBrush="#282828" BorderThickness="1" CornerRadius="8" Padding="14,4">
+        <Border Grid.Row="1" Background="#141414" BorderBrush="#282828" BorderThickness="1" CornerRadius="8" Padding="14,10,14,4">
           <StackPanel>
+            <Grid>
+              <TextBlock Text="ЭТА ВКЛАДКА" Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
+              <Button x:Name="CloseTabBtn" Style="{StaticResource LinkButton}" Content="Закрыть вкладку"
+                      Foreground="#E06C75" HorizontalAlignment="Right" ToolTip="Закрыть вкладку (Ctrl+W)"/>
+            </Grid>
+            <Grid Margin="0,10,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Text="Название" Foreground="#808080" FontSize="11" VerticalAlignment="Center" Margin="0,0,14,0"/>
+              <TextBox x:Name="TabNameBox" Grid.Column="1" Height="28" MaxLength="24" Padding="8,3" FontSize="11.5"
+                       VerticalContentAlignment="Center"/>
+            </Grid>
+            <Border Height="1" Background="#282828" Margin="0,10,0,0"/>
             <CheckBox x:Name="AutoAddChk" Style="{StaticResource Switch}" Margin="0,9">
               <StackPanel>
                 <TextBlock Text="Автодобавление чатов" Foreground="#EEEEEE" FontSize="12"/>
-                <TextBlock Text="подхватывать новые активные чаты" Foreground="#606060" FontSize="10" Margin="0,2,0,0"/>
-              </StackPanel>
-            </CheckBox>
-            <Border Height="1" Background="#282828"/>
-            <CheckBox x:Name="TopmostChk" Style="{StaticResource Switch}" Margin="0,9">
-              <StackPanel>
-                <TextBlock Text="Поверх всех окон" Foreground="#EEEEEE" FontSize="12"/>
-                <TextBlock Text="окно не прячется за другими" Foreground="#606060" FontSize="10" Margin="0,2,0,0"/>
+                <TextBlock Text="новые активные чаты, только в одной вкладке" Foreground="#606060" FontSize="10"
+                           Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
             </CheckBox>
           </StackPanel>
         </Border>
 
-        <Grid Grid.Row="2" Margin="1,14,0,6">
+        <Border Grid.Row="2" Background="#141414" BorderBrush="#282828" BorderThickness="1" CornerRadius="8"
+                Padding="14,4" Margin="0,10,0,0">
+          <CheckBox x:Name="TopmostChk" Style="{StaticResource Switch}" Margin="0,9">
+            <StackPanel>
+              <TextBlock Text="Поверх всех окон" Foreground="#EEEEEE" FontSize="12"/>
+              <TextBlock Text="окно не прячется за другими" Foreground="#606060" FontSize="10" Margin="0,2,0,0"/>
+            </StackPanel>
+          </CheckBox>
+        </Border>
+
+        <Grid Grid.Row="3" Margin="1,14,0,6">
           <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock Text="ЖУРНАЛ" Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
             <Ellipse x:Name="LogLiveDot" Width="5" Height="5" Fill="#7FD88F" Margin="8,0,0,0"
@@ -1268,7 +1447,7 @@ $uiXaml = @'
           <Button x:Name="ClearBtn" Style="{StaticResource LinkButton}" Content="Очистить" HorizontalAlignment="Right"/>
         </Grid>
 
-        <Border Grid.Row="3" Background="#0F0F0F" BorderBrush="#282828" BorderThickness="1"
+        <Border Grid.Row="4" Background="#0F0F0F" BorderBrush="#282828" BorderThickness="1"
                 CornerRadius="8" Padding="1" ClipToBounds="True">
           <RichTextBox x:Name="LogBox" IsReadOnly="True" IsUndoEnabled="False" BorderThickness="0"
                        Background="Transparent" Foreground="#A0A0A0" Padding="10,8"
@@ -1277,7 +1456,7 @@ $uiXaml = @'
                        IsDocumentEnabled="False"/>
         </Border>
 
-        <Grid Grid.Row="4" Margin="1,8,0,0">
+        <Grid Grid.Row="5" Margin="1,8,0,0">
           <TextBlock x:Name="FooterText" Text="" FontSize="10" Foreground="#606060" VerticalAlignment="Center"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="DataBtn" Style="{StaticResource LinkButton}" Content="Папка данных" Margin="0,0,4,0"/>
@@ -1333,6 +1512,12 @@ $DragArea = Find-Ui 'DragArea'
 $TitleIcon = Find-Ui 'TitleIcon'
 $MinBtn = Find-Ui 'MinBtn'
 $CloseBtn = Find-Ui 'CloseBtn'
+$TabRow = Find-Ui 'TabRow'
+$TabScroll = Find-Ui 'TabScroll'
+$TabPanel = Find-Ui 'TabPanel'
+$NewTabBtn = Find-Ui 'NewTabBtn'
+$TabNameBox = Find-Ui 'TabNameBox'
+$CloseTabBtn = Find-Ui 'CloseTabBtn'
 
 $script:BrushCache = @{}
 function Brush([string]$hex) {
@@ -1529,10 +1714,23 @@ function Add-LogLine([string]$entry) {
     catch { }
 }
 
-# ---- лимиты ----
+# ---- лимиты (у каждой вкладки свои) ----
+
+function Set-TabDeadline($tab) {
+    $parsed = Parse-TimeText ([string]$tab.LimitTime)
+    if ($parsed) {
+        $tab.DeadlineTicks = (Get-NextDeadline $parsed.Hour $parsed.Minute).Ticks
+        $tab.LimitSince = Get-Date
+    }
+    else {
+        $tab.DeadlineTicks = [long]0
+    }
+}
 
 function Update-LimitInputs {
-    $mode = [string]$state.LimitMode
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
+    $mode = [string]$tab.LimitMode
     $CountBox.Visibility = if ($mode -eq 'count') { 'Visible' } else { 'Collapsed' }
     $TimeBox.Visibility = if ($mode -eq 'time') { 'Visible' } else { 'Collapsed' }
     $ProgressRow.Visibility = if ($mode -eq 'none') { 'Collapsed' } else { 'Visible' }
@@ -1551,65 +1749,87 @@ function Update-LimitInputs {
     }
 }
 
-function Apply-LimitFromUi {
-    $count = Read-LimitCount
-    if ($count -gt 0) {
-        $state.LimitCount = $count
+function Apply-CountFromUi {
+    if ($script:LoadingTab) { return }
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
+    $n = Read-LimitCount
+    if ($n -gt 0) {
+        $tab.LimitCount = $n
         $CountBox.BorderBrush = Brush '#282828'
+        $script:Dirty = $true
     }
     else {
         $CountBox.BorderBrush = Brush '#E06C75'
     }
+    Update-LimitInputs
+}
 
+function Apply-TimeFromUi {
+    if ($script:LoadingTab) { return }
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
     $parsed = Parse-TimeText $TimeBox.Text
     if ($parsed) {
-        $state.LimitTime = $parsed.Text
-        $state.DeadlineTicks = (Get-NextDeadline $parsed.Hour $parsed.Minute).Ticks
-        $state.LimitSince = Get-Date
+        $tab.LimitTime = $parsed.Text
+        Set-TabDeadline $tab
         $TimeBox.BorderBrush = Brush '#282828'
+        $script:Dirty = $true
     }
     else {
-        $state.DeadlineTicks = [long]0
+        $tab.DeadlineTicks = [long]0
         $TimeBox.BorderBrush = Brush '#E06C75'
     }
-
     Update-LimitInputs
-    $script:Dirty = $true
 }
 
 function Set-LimitModeUi([string]$mode) {
+    if ($script:LoadingTab) { return }
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
     if ($mode -notin @('none', 'count', 'time')) { $mode = 'none' }
-    $state.LimitMode = $mode
-    switch ($mode) {
-        'none' { $LimitNone.IsChecked = $true }
-        'count' { $LimitCountRadio.IsChecked = $true }
-        'time' { $LimitTimeRadio.IsChecked = $true }
-    }
-    if ($mode -eq 'time') {
-        $parsed = Parse-TimeText $TimeBox.Text
-        if ($parsed) {
-            $state.LimitTime = $parsed.Text
-            $state.DeadlineTicks = (Get-NextDeadline $parsed.Hour $parsed.Minute).Ticks
-            $state.LimitSince = Get-Date
-        }
-        else {
-            $state.DeadlineTicks = [long]0
-        }
-    }
+    $tab.LimitMode = $mode
+    if ($mode -eq 'time') { Set-TabDeadline $tab }
     elseif ($mode -eq 'count') {
         $n = Read-LimitCount
-        if ($n -gt 0) { $state.LimitCount = $n }
+        if ($n -gt 0) { $tab.LimitCount = $n }
     }
     Update-LimitInputs
     Update-Stats
     $script:Dirty = $true
 }
 
-# ---- статус и статистика ----
+# ---- статус и статистика (показывают активную вкладку) ----
 
 $script:UiStatus = ''
-$script:LastReason = ''
 $script:LastServer = ''
+
+function Get-TabStatusKey($tab) {
+    if (-not [bool]$tab.Stop) { return 'running' }
+    switch ([string]$tab.StopReason) {
+        'error' { return 'error' }
+        'limit' { return 'limit' }
+        default { return 'paused' }
+    }
+}
+
+function Get-TabDotColor([string]$key) {
+    switch ($key) {
+        'running' { return '#7FD88F' }
+        'limit' { return '#F5A742' }
+        'error' { return '#E06C75' }
+        default { return '#606060' }
+    }
+}
+
+function Get-TabStatusWord([string]$key) {
+    switch ($key) {
+        'running' { return 'работает' }
+        'limit' { return 'лимит' }
+        'error' { return 'нет связи' }
+        default { return 'пауза' }
+    }
+}
 
 function Show-Balloon([string]$title, [string]$text) {
     if (-not $script:TrayIcon) { return }
@@ -1640,66 +1860,44 @@ function Set-StatusLook([string]$label, [string]$color, [string]$glyph, [string]
 
 function Update-StatusVisual {
     if ($null -eq $StatusDot) { return }
-    $reason = [string]$state.StopReason
-    $running = -not [bool]$state.Stop
-
-    if ($running) { $statusKey = 'running' }
-    elseif ($reason -eq 'error') { $statusKey = 'error' }
-    elseif ($reason -eq 'limit') { $statusKey = 'limit' }
-    else { $statusKey = 'paused' }
-
-    if ($statusKey -ne $script:UiStatus) {
-        $script:UiStatus = $statusKey
-        switch ($statusKey) {
-            'running' { Set-StatusLook 'РАБОТАЕТ' '#7FD88F' ([string][char]0xE71A) 'ОСТАНОВИТЬ' '#E06C75' '#0A0A0A' $true }
-            'paused' { Set-StatusLook 'ПАУЗА' '#F5A742' ([string][char]0xE768) 'ЗАПУСТИТЬ' '#FAB283' '#0A0A0A' $false }
-            'limit' { Set-StatusLook 'ЛИМИТ' '#F5A742' ([string][char]0xE768) 'НОВЫЙ ЗАПУСК' '#FAB283' '#0A0A0A' $false }
-            'error' { Set-StatusLook 'НЕТ СВЯЗИ' '#E06C75' ([string][char]0xE72C) 'ПОВТОРИТЬ' '#5C9CF5' '#0A0A0A' $false }
-        }
-
-        if ($reason -ne $script:LastReason) {
-            if ($reason -eq 'error') {
-                Show-Balloon 'OpenCode AutoContinue' 'Нет связи с OpenCode. Автопродолжение приостановлено, переподключение в фоне.'
-            }
-            elseif ($reason -eq 'limit') {
-                Show-Balloon 'OpenCode AutoContinue' 'Лимит запуска достигнут — автопродолжение остановлено.'
-            }
-            $script:LastReason = $reason
-        }
-
-        if ($script:TrayIcon) {
-            $script:TrayIcon.Text = if ($running) { 'OpenCode AutoContinue — работает' } else { 'OpenCode AutoContinue — пауза' }
-        }
-        if ($script:TrayToggle) {
-            $script:TrayToggle.Text = if ($running) { 'Остановить' } else { 'Запустить' }
-        }
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
+    $statusKey = Get-TabStatusKey $tab
+    if ($statusKey -eq $script:UiStatus) { return }
+    $script:UiStatus = $statusKey
+    switch ($statusKey) {
+        'running' { Set-StatusLook 'РАБОТАЕТ' '#7FD88F' ([string][char]0xE71A) 'ОСТАНОВИТЬ' '#E06C75' '#0A0A0A' $true }
+        'paused' { Set-StatusLook 'ПАУЗА' '#F5A742' ([string][char]0xE768) 'ЗАПУСТИТЬ' '#FAB283' '#0A0A0A' $false }
+        'limit' { Set-StatusLook 'ЛИМИТ' '#F5A742' ([string][char]0xE768) 'НОВЫЙ ЗАПУСК' '#FAB283' '#0A0A0A' $false }
+        'error' { Set-StatusLook 'НЕТ СВЯЗИ' '#E06C75' ([string][char]0xE72C) 'ПОВТОРИТЬ' '#5C9CF5' '#0A0A0A' $false }
     }
 }
 
 function Update-Stats {
     if ($null -eq $StatusMeta) { return }
-    $chats = @($state.Chats)
-    $chatCount = $chats.Count
-    $sent = [int]$state.SentThisRun
-    $running = -not [bool]$state.Stop
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
+    $chats = @($tab.Chats)
+    $sent = [int]$tab.SentThisRun
+    $running = -not [bool]$tab.Stop
 
     if ($running) {
-        $elapsed = if ($state.RunStartedAt -ne [datetime]::MinValue) { Format-Duration ((Get-Date) - [datetime]$state.RunStartedAt) } else { '00:00:00' }
+        $elapsed = if ($tab.RunStartedAt -ne [datetime]::MinValue) { Format-Duration ((Get-Date) - [datetime]$tab.RunStartedAt) } else { '00:00:00' }
         $StatusMeta.Text = "$sent отпр. · $elapsed"
     }
-    elseif ([string]$state.StopReason -eq 'error') {
+    elseif ([string]$tab.StopReason -eq 'error') {
         $StatusMeta.Text = 'переподключаюсь…'
     }
     else {
         $StatusMeta.Text = "$sent отпр."
     }
 
-    $ChatCountText.Text = [string]$chatCount
+    $ChatCountText.Text = [string]$chats.Count
 
-    $mode = [string]$state.LimitMode
+    $mode = [string]$tab.LimitMode
     $now = Get-Date
     if ($mode -eq 'count') {
-        $limit = [Math]::Max(1, [int]$state.LimitCount)
+        $limit = [Math]::Max(1, [int]$tab.LimitCount)
         $value = [Math]::Min($sent, $limit)
         $LimitProgress.Maximum = $limit
         $LimitProgress.Value = $value
@@ -1707,7 +1905,7 @@ function Update-Stats {
         $ProgressLabel.Text = "$value / $limit"
     }
     elseif ($mode -eq 'time') {
-        $deadline = if ([long]$state.DeadlineTicks -gt 0) { [datetime]::new([long]$state.DeadlineTicks) } else { $null }
+        $deadline = if ([long]$tab.DeadlineTicks -gt 0) { [datetime]::new([long]$tab.DeadlineTicks) } else { $null }
         $LimitProgress.Maximum = 1
         if ($null -ne $deadline) {
             $left = $deadline - $now
@@ -1718,8 +1916,8 @@ function Update-Stats {
             }
             else {
                 $ProgressLabel.Text = "до $($deadline.ToString('HH:mm')) · осталось $(Format-Duration $left)"
-                $start = [datetime]$state.RunStartedAt
-                if ($state.LimitSince -ne [datetime]::MinValue -and [datetime]$state.LimitSince -gt $start) { $start = [datetime]$state.LimitSince }
+                $start = [datetime]$tab.RunStartedAt
+                if ($tab.LimitSince -ne [datetime]::MinValue -and [datetime]$tab.LimitSince -gt $start) { $start = [datetime]$tab.LimitSince }
                 if ($start -ne [datetime]::MinValue -and $deadline -gt $start) {
                     $total = ($deadline - $start).TotalSeconds
                     $passed = ($now - $start).TotalSeconds
@@ -1748,11 +1946,10 @@ function Update-Stats {
         $FooterText.Text = "v$($script:AppVersion) · $short"
     }
 
-    $LogLiveDot.Fill = if ($running) { Brush '#7FD88F' } else { Brush '#606060' }
-    $LogLiveDot.Opacity = if ($running) { 0.85 } else { 0.4 }
+    $anyRunning = @($state.Tabs | Where-Object { -not $_.Stop }).Count -gt 0
+    $LogLiveDot.Fill = if ($anyRunning) { Brush '#7FD88F' } else { Brush '#606060' }
+    $LogLiveDot.Opacity = if ($anyRunning) { 0.85 } else { 0.4 }
 }
-
-# ---- строки чатов ----
 
 $script:Rows = @()
 $script:LastSig = ''
@@ -1865,10 +2062,18 @@ function New-ChatRow($chat) {
     }
 }
 
+function Get-ChatSig($tab) {
+    if ($null -eq $tab) { return '' }
+    $parts = @()
+    foreach ($c in @($tab.Chats)) { $parts += ([string]$c.Id + '|' + [string]$c.Title) }
+    return ($tab.Id + '#' + ($parts -join '~'))
+}
+
 function Build-ChatRows {
+    $tab = $script:ActiveTab
     $ChatPanel.Children.Clear()
     $script:Rows = @()
-    $chats = @($state.Chats)
+    $chats = if ($null -ne $tab) { @($tab.Chats) } else { @() }
 
     if ($chats.Count -eq 0) {
         $empty = [Windows.Controls.Border]::new()
@@ -1879,7 +2084,7 @@ function Build-ChatRows {
         $empty.Padding = [Windows.Thickness]::new(12, 11, 12, 11)
         $empty.Margin = [Windows.Thickness]::new(0, 0, 0, 4)
         $t = [Windows.Controls.TextBlock]::new()
-        $t.Text = if ([bool]$state.AutoAdd) { 'Жду активные чаты OpenCode…' } else { 'Чатов нет — нажмите «+ Добавить»' }
+        $t.Text = if ($null -ne $tab -and [bool]$tab.AutoAdd) { 'Жду активные чаты OpenCode…' } else { 'Чатов нет — нажмите «+ Добавить»' }
         $t.FontSize = 11
         $t.Foreground = Brush '#606060'
         $t.TextTrimming = 'CharacterEllipsis'
@@ -1896,7 +2101,9 @@ function Build-ChatRows {
 }
 
 function Update-ChatRows {
-    $chats = @($state.Chats)
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
+    $chats = @($tab.Chats)
     if ($chats.Count -ne $script:Rows.Count) { Build-ChatRows; return }
 
     for ($i = 0; $i -lt $chats.Count; $i++) {
@@ -1929,76 +2136,487 @@ function Remove-ChatFromUi([string]$id) {
 
 # ---- запуск / пауза ----
 
-function Start-Run {
-    $wasReason = [string]$state.StopReason
-    $mode = [string]$state.LimitMode
+function Tab-LogName($tab) {
+    if (@($state.Tabs).Count -gt 1) { return '«' + [string]$tab.Name + '»: ' }
+    return ''
+}
+
+function Start-Run($tab, [bool]$interactive = $true) {
+    if ($null -eq $tab) { return $false }
+    $isActive = ($null -ne $script:ActiveTab -and [string]$script:ActiveTab.Id -eq [string]$tab.Id)
+    $wasReason = [string]$tab.StopReason
+    $mode = [string]$tab.LimitMode
+
+    if ([string]::IsNullOrWhiteSpace([string]$tab.Message)) {
+        Write-UiLog 'warn' ((Tab-LogName $tab) + 'нечего отправлять — укажите текст сообщения')
+        if ($isActive -and $interactive) { $MessageBox.Focus() | Out-Null }
+        return $false
+    }
 
     if ($mode -eq 'count') {
-        $n = Read-LimitCount
+        $n = if ($isActive) { Read-LimitCount } else { [int]$tab.LimitCount }
         if ($n -le 0) {
-            Write-UiLog 'warn' 'Лимит итераций: укажите число от 1 до 99999'
-            $CountBox.Focus() | Out-Null
-            return
+            Write-UiLog 'warn' ((Tab-LogName $tab) + 'лимит итераций: укажите число от 1 до 99999')
+            if ($isActive) { $CountBox.Focus() | Out-Null }
+            return $false
         }
-        $state.LimitCount = $n
-        if ($state.SentThisRun -ge $n) {
-            $state.SentThisRun = 0
-            Write-UiLog 'info' 'Счётчик итераций сброшен — новый запуск'
+        $tab.LimitCount = $n
+        if ($tab.SentThisRun -ge $n) {
+            $tab.SentThisRun = 0
+            Write-UiLog 'info' ((Tab-LogName $tab) + 'счётчик итераций сброшен — новый запуск')
         }
     }
     elseif ($mode -eq 'time') {
-        $parsed = Parse-TimeText $TimeBox.Text
+        $timeText = if ($isActive) { $TimeBox.Text } else { [string]$tab.LimitTime }
+        $parsed = Parse-TimeText $timeText
         if (-not $parsed) {
-            Write-UiLog 'warn' 'Лимит по времени: укажите время в формате ЧЧ:ММ'
-            $TimeBox.Focus() | Out-Null
-            return
+            Write-UiLog 'warn' ((Tab-LogName $tab) + 'лимит по времени: укажите время в формате ЧЧ:ММ')
+            if ($isActive) { $TimeBox.Focus() | Out-Null }
+            return $false
         }
-        $state.LimitTime = $parsed.Text
-        $deadline = Get-NextDeadline $parsed.Hour $parsed.Minute
-        $state.DeadlineTicks = $deadline.Ticks
-        $state.LimitSince = Get-Date
+        $tab.LimitTime = $parsed.Text
+        Set-TabDeadline $tab
     }
 
-    if ($state.RunStartedAt -eq [datetime]::MinValue -or $wasReason -eq 'limit') {
-        $state.RunStartedAt = Get-Date
+    if ($tab.RunStartedAt -eq [datetime]::MinValue -or $wasReason -eq 'limit') {
+        $tab.RunStartedAt = Get-Date
     }
 
-    # после паузы таймер «ответ не начался» не должен считать время простоя
-    foreach ($c in @($state.Chats)) {
-        if ([string]$c.Phase -eq 'sent') {
-            $c.SentAt = Get-Date
-            $c.NoAnswer = 0
-        }
-    }
+    Reset-TabChatsForResume $tab
 
-    $state.Stop = $false
-    $state.StopReason = ''
-    $state.LimitHit = ''
+    $tab.Stop = $false
+    $tab.StopReason = ''
+    $tab.UserPaused = $false
+    $tab.LimitHit = ''
     $state.ApiError = ''
     $state.ErrorStreak = 0
 
-    Write-UiLog 'ok' '▶ Автопродолжение запущено'
+    Write-UiLog 'ok' ('▶ ' + (Tab-LogName $tab) + 'автопродолжение запущено')
+    $script:Dirty = $true
+    return $true
+}
+
+function Stop-Run($tab) {
+    if ($null -eq $tab -or $tab.Stop) { return }
+    $tab.Stop = $true
+    $tab.StopReason = 'user'
+    $tab.UserPaused = $true
+    Write-UiLog 'warn' ('⏸ ' + (Tab-LogName $tab) + 'остановлено вручную')
+    $script:Dirty = $true
+}
+
+function Toggle-Run {
+    $tab = $script:ActiveTab
+    if ($null -eq $tab) { return }
+    if ($tab.Stop) { [void](Start-Run $tab $true) } else { Stop-Run $tab }
     Update-StatusVisual
     Update-Stats
 }
 
-function Toggle-Run {
-    if ($state.Stop) { Start-Run }
+# из трея: если хоть одна вкладка работает — остановить все, иначе запустить все
+function Toggle-All {
+    $tabs = @($state.Tabs)
+    $anyRunning = @($tabs | Where-Object { -not $_.Stop }).Count -gt 0
+    if ($anyRunning) {
+        foreach ($t in $tabs) { Stop-Run $t }
+    }
     else {
-        $state.Stop = $true
-        $state.StopReason = 'user'
-        Write-UiLog 'warn' '⏸ Автопродолжение остановлено вручную'
-        Update-StatusVisual
-        Update-Stats
+        foreach ($t in $tabs) { [void](Start-Run $t $false) }
+    }
+    Update-StatusVisual
+    Update-Stats
+}
+
+# ---- вкладки ----
+
+$script:TabUi = @{}
+$script:LoadingTab = $false
+
+function Find-TabById([string]$id) {
+    foreach ($t in @($state.Tabs)) { if ([string]$t.Id -eq $id) { return $t } }
+    return $null
+}
+
+function Update-TabVisual($tab) {
+    $ui = $script:TabUi[[string]$tab.Id]
+    if (-not $ui) { return }
+    $active = ($null -ne $script:ActiveTab -and [string]$script:ActiveTab.Id -eq [string]$tab.Id)
+    $hover = [bool]$ui.Hover
+    $multi = (@($state.Tabs).Count -gt 1)
+
+    $ui.Root.Background = if ($active) { Brush '#141414' } elseif ($hover) { Brush '#0F0F0F' } else { [Windows.Media.Brushes]::Transparent }
+    $ui.Root.BorderBrush = if ($active) { Brush '#FAB283' } else { [Windows.Media.Brushes]::Transparent }
+    $ui.Title.Foreground = if ($active -or $hover) { Brush '#EEEEEE' } else { Brush '#808080' }
+
+    $showClose = $multi -and ($active -or ($hover -and -not [bool]$ui.Compact))
+    $ui.Close.Visibility = if ($multi -and -not [bool]$ui.Compact) { 'Visible' } else { 'Collapsed' }
+    $ui.Close.Opacity = if ($showClose) { 1 } else { 0 }
+    $ui.Close.IsHitTestVisible = $showClose
+}
+
+function Update-TabDot($tab) {
+    $ui = $script:TabUi[[string]$tab.Id]
+    if (-not $ui) { return }
+    $key = Get-TabStatusKey $tab
+    $ui.Dot.Fill = Brush (Get-TabDotColor $key)
+    $ui.Root.ToolTip = ([string]$tab.Name + ' · ' + (Get-TabStatusWord $key))
+}
+
+# вкладки делят ширину поровну (как в Chrome); если места мало, неактивные
+# сжимаются до точки статуса, а активная остаётся читаемой
+function Update-TabLayout {
+    $tabs = @($state.Tabs)
+    $n = $tabs.Count
+    if ($n -eq 0 -or $null -eq $TabRow -or $TabRow.ActualWidth -lt 80) { return }
+    $gap = 2
+    $avail = [Math]::Max(60, $TabRow.ActualWidth - 32)
+    $TabScroll.MaxWidth = $avail
+
+    $w = [Math]::Floor(($avail - $gap * $n) / $n)
+    $compact = ($w -lt 60)
+    if (-not $compact) {
+        $wAct = [Math]::Min(150, $w)
+        $wIn = $wAct
+    }
+    else {
+        $wAct = 100
+        $wIn = [Math]::Floor(($avail - $wAct - $gap * $n) / [Math]::Max(1, $n - 1))
+        $wIn = [Math]::Max(34, [Math]::Min(60, $wIn))
+    }
+
+    foreach ($tab in $tabs) {
+        $ui = $script:TabUi[[string]$tab.Id]
+        if (-not $ui) { continue }
+        $active = ($null -ne $script:ActiveTab -and [string]$script:ActiveTab.Id -eq [string]$tab.Id)
+        $dotOnly = ($compact -and -not $active)
+        $ui.Compact = $dotOnly
+        $ui.Root.Width = if ($active) { $wAct } else { $wIn }
+        $ui.Title.Visibility = if ($dotOnly) { 'Collapsed' } else { 'Visible' }
+        $ui.Dot.Margin = if ($dotOnly) { [Windows.Thickness]::new(0) } else { [Windows.Thickness]::new(10, 0, 6, 0) }
+        $ui.Dot.HorizontalAlignment = if ($dotOnly) { 'Center' } else { 'Left' }
+        [Windows.Controls.Grid]::SetColumnSpan($ui.Dot, $(if ($dotOnly) { 3 } else { 1 }))
+        Update-TabVisual $tab
     }
 }
 
-# ---- диалог добавления чата ----
+function Refresh-TabControls {
+    $tabs = @($state.Tabs)
+    $CloseTabBtn.IsEnabled = ($tabs.Count -gt 1)
+    $NewTabBtn.IsEnabled = ($tabs.Count -lt $script:MaxTabs)
+    foreach ($t in $tabs) { Update-TabVisual $t }
+    Update-TabLayout
+}
+
+function New-TabItem($tab) {
+    $id = [string]$tab.Id
+
+    $root = [Windows.Controls.Border]::new()
+    $root.Height = 30
+    $root.VerticalAlignment = 'Bottom'
+    $root.CornerRadius = [Windows.CornerRadius]::new(7, 7, 0, 0)
+    $root.BorderThickness = [Windows.Thickness]::new(0, 2, 0, 0)
+    $root.BorderBrush = [Windows.Media.Brushes]::Transparent
+    $root.Background = [Windows.Media.Brushes]::Transparent
+    $root.Margin = [Windows.Thickness]::new(0, 0, 2, 0)
+    $root.Cursor = [Windows.Input.Cursors]::Hand
+    $root.Tag = $id
+
+    $grid = [Windows.Controls.Grid]::new()
+    foreach ($w in @('Auto', '*', 'Auto')) {
+        $cd = [Windows.Controls.ColumnDefinition]::new()
+        $cd.Width = if ($w -eq '*') { [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star) } else { [Windows.GridLength]::Auto }
+        $grid.ColumnDefinitions.Add($cd) | Out-Null
+    }
+
+    $dot = [Windows.Shapes.Ellipse]::new()
+    $dot.Width = 6
+    $dot.Height = 6
+    $dot.Margin = [Windows.Thickness]::new(10, 0, 6, 0)
+    $dot.VerticalAlignment = 'Center'
+    $dot.HorizontalAlignment = 'Left'
+    $dot.Fill = Brush (Get-TabDotColor (Get-TabStatusKey $tab))
+    $grid.Children.Add($dot) | Out-Null
+
+    $title = [Windows.Controls.TextBlock]::new()
+    $title.Text = [string]$tab.Name
+    $title.FontSize = 11
+    $title.TextTrimming = 'CharacterEllipsis'
+    $title.VerticalAlignment = 'Center'
+    $title.Foreground = Brush '#808080'
+    [Windows.Controls.Grid]::SetColumn($title, 1)
+    $grid.Children.Add($title) | Out-Null
+
+    $close = [Windows.Controls.Border]::new()
+    $close.Width = 16
+    $close.Height = 16
+    $close.CornerRadius = [Windows.CornerRadius]::new(4)
+    $close.Margin = [Windows.Thickness]::new(4, 0, 6, 0)
+    $close.Background = [Windows.Media.Brushes]::Transparent
+    $close.VerticalAlignment = 'Center'
+    $close.Cursor = [Windows.Input.Cursors]::Hand
+    $close.ToolTip = 'Закрыть вкладку (Ctrl+W)'
+    $close.Tag = $id
+    $close.Opacity = 0
+    $x = [Windows.Controls.TextBlock]::new()
+    $x.Text = [string][char]0x2715
+    $x.FontSize = 8.5
+    $x.Foreground = Brush '#808080'
+    $x.HorizontalAlignment = 'Center'
+    $x.VerticalAlignment = 'Center'
+    $close.Child = $x
+    [Windows.Controls.Grid]::SetColumn($close, 2)
+    $grid.Children.Add($close) | Out-Null
+
+    $root.Child = $grid
+
+    $refs = @{ Root = $root; Dot = $dot; Title = $title; Close = $close; Hover = $false; Compact = $false }
+    $script:TabUi[$id] = $refs
+
+    $root.Add_MouseEnter({
+            param($sender, $e)
+            $ui = $script:TabUi[[string]$sender.Tag]
+            $t = Find-TabById ([string]$sender.Tag)
+            if ($ui -and $t) { $ui.Hover = $true; Update-TabVisual $t }
+        })
+    $root.Add_MouseLeave({
+            param($sender, $e)
+            $ui = $script:TabUi[[string]$sender.Tag]
+            $t = Find-TabById ([string]$sender.Tag)
+            if ($ui -and $t) { $ui.Hover = $false; Update-TabVisual $t }
+        })
+    $root.Add_MouseLeftButtonDown({
+            param($sender, $e)
+            $t = Find-TabById ([string]$sender.Tag)
+            if ($null -eq $t) { return }
+            if ($e.ClickCount -ge 2) {
+                # двойной щелчок — переименовать
+                if ([string]$script:ActiveTab.Id -ne [string]$t.Id) { Select-Tab $t }
+                Show-SettingsView $true
+                $SettingsView.UpdateLayout()
+                $TabNameBox.Focus() | Out-Null
+                $TabNameBox.SelectAll()
+            }
+            elseif ([string]$script:ActiveTab.Id -ne [string]$t.Id) {
+                Select-Tab $t
+            }
+            $e.Handled = $true
+        })
+    # средняя кнопка мыши закрывает вкладку, как в браузере
+    $root.Add_MouseUp({
+            param($sender, $e)
+            if ($e.ChangedButton -eq 'Middle') {
+                $t = Find-TabById ([string]$sender.Tag)
+                if ($t) { Close-Tab $t }
+                $e.Handled = $true
+            }
+        })
+
+    $close.Add_MouseEnter({ $this.Background = Brush '#2A1416'; $this.Child.Foreground = Brush '#E06C75' })
+    $close.Add_MouseLeave({ $this.Background = [Windows.Media.Brushes]::Transparent; $this.Child.Foreground = Brush '#808080' })
+    $close.Add_MouseLeftButtonDown({ param($sender, $e) $e.Handled = $true })
+    $close.Add_MouseLeftButtonUp({
+            param($sender, $e)
+            $t = Find-TabById ([string]$sender.Tag)
+            if ($t) { Close-Tab $t }
+            $e.Handled = $true
+        })
+
+    return $refs
+}
+
+function Add-TabItem($tab) {
+    $refs = New-TabItem $tab
+    [void]$TabPanel.Children.Add($refs.Root)
+    Update-TabDot $tab
+}
+
+# подгружает данные вкладки в общие элементы окна
+function Select-Tab($tab) {
+    if ($null -eq $tab) { return }
+    $script:ActiveTab = $tab
+    $script:LoadingTab = $true
+    try {
+        $MessageBox.Text = [string]$tab.Message
+        $CountBox.Text = [string]$tab.LimitCount
+        $TimeBox.Text = [string]$tab.LimitTime
+        $AutoAddChk.IsChecked = [bool]$tab.AutoAdd
+        $TabNameBox.Text = [string]$tab.Name
+        switch ([string]$tab.LimitMode) {
+            'count' { $LimitCountRadio.IsChecked = $true }
+            'time' { $LimitTimeRadio.IsChecked = $true }
+            default { $LimitNone.IsChecked = $true }
+        }
+    }
+    finally {
+        $script:LoadingTab = $false
+    }
+    $MessageHint.Visibility = if ($MessageBox.Text.Length -gt 0) { 'Collapsed' } else { 'Visible' }
+    $CountBox.BorderBrush = Brush '#282828'
+    $TimeBox.BorderBrush = Brush '#282828'
+    Update-LimitInputs
+    Build-ChatRows
+    $script:LastSig = Get-ChatSig $tab
+    $script:UiStatus = ''
+    Update-StatusVisual
+    Update-Stats
+    Refresh-TabControls
+    $ui = $script:TabUi[[string]$tab.Id]
+    if ($ui) { try { $TabPanel.UpdateLayout(); $ui.Root.BringIntoView() } catch { } }
+    $script:Dirty = $true
+}
+
+function Add-Tab {
+    if (@($state.Tabs).Count -ge $script:MaxTabs) {
+        Write-UiLog 'warn' ('Больше ' + $script:MaxTabs + ' вкладок не поместится')
+        return
+    }
+    $names = @($state.Tabs | ForEach-Object { [string]$_.Name })
+    $n = 1
+    while ($names -contains ('Задача ' + $n)) { $n++ }
+
+    # новая вкладка стартует на паузе и без текста: пока не задан промт и не выбраны чаты, отправлять нечего
+    $tab = New-TabObject @{
+        id = (New-TabId); name = ('Задача ' + $n); message = ''; autoAdd = $false; paused = $true
+        chats = @(); limitMode = 'none'; limitCount = 50; limitTime = '18:00'
+    } $false
+    $state.Tabs = @($state.Tabs) + , $tab
+    Add-TabItem $tab
+    Select-Tab $tab
+    Show-SettingsView $false
+    Write-UiLog 'info' ('Новая вкладка «' + $tab.Name + '» — на паузе, укажите текст и добавьте чаты')
+    $MessageBox.Focus() | Out-Null
+}
+
+function Close-Tab($tab) {
+    if ($null -eq $tab) { return }
+    $tabs = @($state.Tabs)
+    if ($tabs.Count -le 1) { return }
+
+    $chatCount = @($tab.Chats).Count
+    if ($chatCount -gt 0) {
+        $word = Plural $chatCount 'чат' 'чата' 'чатов'
+        $text = '«' + [string]$tab.Name + '»: ' + $chatCount + ' ' + $word + ' перестанут отслеживаться, текст сообщения и лимит будут потеряны.'
+        if (-not (Show-Confirm 'Закрыть вкладку?' $text 'Закрыть')) { return }
+    }
+
+    $idx = 0
+    for ($i = 0; $i -lt $tabs.Count; $i++) {
+        if ([string]$tabs[$i].Id -eq [string]$tab.Id) { $idx = $i; break }
+    }
+
+    $tab.Deleted = $true
+    $tab.Stop = $true
+    $remaining = @($tabs | Where-Object { [string]$_.Id -ne [string]$tab.Id })
+    $state.Tabs = $remaining
+
+    $ui = $script:TabUi[[string]$tab.Id]
+    if ($ui) {
+        [void]$TabPanel.Children.Remove($ui.Root)
+        $script:TabUi.Remove([string]$tab.Id)
+    }
+    Write-UiLog 'info' ('Вкладка «' + [string]$tab.Name + '» закрыта')
+
+    if ($null -ne $script:ActiveTab -and [string]$script:ActiveTab.Id -eq [string]$tab.Id) {
+        Select-Tab $remaining[[Math]::Min($idx, $remaining.Count - 1)]
+    }
+    else {
+        Refresh-TabControls
+    }
+    $script:Dirty = $true
+}
+
+function Step-Tab([int]$direction) {
+    $tabs = @($state.Tabs)
+    if ($tabs.Count -lt 2) { return }
+    $cur = 0
+    for ($i = 0; $i -lt $tabs.Count; $i++) {
+        if ([string]$tabs[$i].Id -eq [string]$script:ActiveTab.Id) { $cur = $i; break }
+    }
+    $next = ($cur + $direction + $tabs.Count) % $tabs.Count
+    Select-Tab $tabs[$next]
+}
+
+function Select-TabNumber([int]$number) {
+    $tabs = @($state.Tabs)
+    if ($number -ge 1 -and $number -le $tabs.Count) { Select-Tab $tabs[$number - 1] }
+}
+
+# маленький тёмный диалог подтверждения (системный MessageBox светлый и выбивается из стиля)
+function Show-Confirm([string]$title, [string]$text, [string]$okText, [bool]$infoOnly = $false) {
+    $cfXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="340" SizeToContent="Height" WindowStyle="None" ResizeMode="NoResize"
+        ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
+        Background="#0A0A0A" Foreground="#EEEEEE"
+        FontFamily="Cascadia Mono, Consolas" FontSize="12"
+        TextOptions.TextFormattingMode="Display" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="CfButton" TargetType="Button">
+      <Setter Property="Height" Value="30"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Grid>
+              <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                      BorderThickness="1" CornerRadius="5"/>
+              <Border x:Name="Hover" Background="#1FFFFFFF" CornerRadius="5" Opacity="0"/>
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Hover" Property="Opacity" Value="1"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Border BorderBrush="#3C3C3C" BorderThickness="1">
+    <StackPanel Margin="18,16,18,16">
+      <TextBlock x:Name="CfTitle" FontWeight="SemiBold" FontSize="13"/>
+      <TextBlock x:Name="CfText" Margin="0,10,0,0" Foreground="#A0A0A0" TextWrapping="Wrap" LineHeight="18"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+        <Button x:Name="CfCancel" Content="Отмена" Width="90" Style="{StaticResource CfButton}"
+                Background="Transparent" BorderBrush="#3C3C3C" Foreground="#A0A0A0"/>
+        <Button x:Name="CfOk" Width="110" Margin="8,0,0,0" Style="{StaticResource CfButton}"
+                Background="#E06C75" BorderBrush="#E06C75" Foreground="#0A0A0A" FontWeight="Bold"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+'@
+    $dlg = [Windows.Markup.XamlReader]::Parse($cfXaml)
+    $dlg.Owner = $window
+    $dlg.Topmost = $window.Topmost
+    $dlg.FindName('CfTitle').Text = $title
+    $dlg.FindName('CfText').Text = $text
+    $dlg.FindName('CfOk').Content = $okText
+    if ($infoOnly) {
+        $dlg.FindName('CfCancel').Visibility = 'Collapsed'
+        $okBtn = $dlg.FindName('CfOk')
+        $okBtn.Background = Brush '#FAB283'
+        $okBtn.BorderBrush = Brush '#FAB283'
+    }
+    $script:ConfirmResult = $false
+    $dlg.FindName('CfOk').Add_Click({ $script:ConfirmResult = $true; $dlg.Close() })
+    $dlg.FindName('CfCancel').Add_Click({ $dlg.Close() })
+    $dlg.Add_KeyDown({
+            param($s, $e)
+            if ($e.Key -eq 'Escape') { $dlg.Close() }
+            elseif ($e.Key -eq 'Return') { $script:ConfirmResult = $true; $dlg.Close() }
+        })
+    [void]$dlg.ShowDialog()
+    return [bool]$script:ConfirmResult
+}
 
 function Show-AddDialog {
+    $script:DialogTab = $script:ActiveTab
     if (-not (Update-ServiceInfo)) {
-        [void][Windows.MessageBox]::Show('Сервис OpenCode не найден. Запустите OpenCode и попробуйте снова.',
-            'OpenCode AutoContinue', 'OK', 'Warning')
+        [void](Show-Confirm 'Сервис не найден' 'Сервис OpenCode не найден. Запустите OpenCode и попробуйте снова.' 'OK' $true)
         return
     }
     Update-ServiceInfo | Out-Null
@@ -2007,18 +2625,18 @@ function Show-AddDialog {
         $r = Invoke-OcApi 'GET' '/api/session?limit=100' -Timeout 6000
     }
     catch {
-        [void][Windows.MessageBox]::Show('Не удалось получить список чатов: ' + $_.Exception.Message,
-            'OpenCode AutoContinue', 'OK', 'Warning')
+        [void](Show-Confirm 'Нет списка чатов' ('Не удалось получить список чатов: ' + $_.Exception.Message) 'OK' $true)
         return
     }
 
     $tracked = @{}
-    foreach ($c in @($state.Chats)) { if ($c.Id) { $tracked[[string]$c.Id] = $true } }
+    foreach ($t in @($state.Tabs)) {
+        foreach ($c in @($t.Chats)) { if ($c.Id) { $tracked[[string]$c.Id] = $true } }
+    }
 
     $all = @($r.data | Where-Object { -not $_.parentID -and -not $_.archived -and -not $tracked.ContainsKey([string]$_.id) })
     if ($all.Count -eq 0) {
-        [void][Windows.MessageBox]::Show('Нет доступных чатов для добавления.',
-            'OpenCode AutoContinue', 'OK', 'Information')
+        [void](Show-Confirm 'Нет чатов' 'Все недавние сессии уже добавлены — в эту или в другие вкладки.' 'OK' $true)
         return
     }
 
@@ -2238,6 +2856,7 @@ function Show-AddDialog {
     $hint = $dlg.FindName('SearchHint')
     $list = $dlg.FindName('SessionList')
     $dlgTitle = $dlg.FindName('DlgTitle')
+    $dlgTitle.Text = 'Добавить в «' + [string]$script:DialogTab.Name + '»'
     $dlgTitle.Add_MouseLeftButtonDown({ try { $dlg.DragMove() } catch { } })
 
     $dlgClose.Add_Click({ $dlg.Close() })
@@ -2293,7 +2912,7 @@ function Show-AddDialog {
         if ($idx -lt 0 -or $idx -ge $script:DialogCandidates.Count) { return }
         $cand = $script:DialogCandidates[$idx]
         if (-not $cand.Id) { return }
-        $state.AddQueue.Enqueue(@{ Id = [string]$cand.Id; Title = [string]$cand.Title })
+        $state.AddQueue.Enqueue(@{ Id = [string]$cand.Id; Title = [string]$cand.Title; TabId = [string]$script:DialogTab.Id })
         $state.Ignored.Remove([string]$cand.Id)
         $script:Dirty = $true
         $dlg.Close()
@@ -2309,25 +2928,30 @@ function Show-AddDialog {
     [void]$dlg.ShowDialog()
 }
 
-# ---- настройки из контролов ----
-
-$MessageBox.Text = [string]$state.Message
-$MessageHint.Visibility = if ($MessageBox.Text.Length -gt 0) { 'Collapsed' } else { 'Visible' }
-$AutoAddChk.IsChecked = [bool]$state.AutoAdd
-$CountBox.Text = [string]$state.LimitCount
-$TimeBox.Text = [string]$state.LimitTime
-
 # ---- обработчики ----
 
 $MessageBox.Add_TextChanged({
-        $state.Message = $MessageBox.Text
+        if ($script:LoadingTab) { return }
         $MessageHint.Visibility = if ($MessageBox.Text.Length -gt 0) { 'Collapsed' } else { 'Visible' }
+        if ($null -ne $script:ActiveTab) { $script:ActiveTab.Message = $MessageBox.Text }
         $script:Dirty = $true
     })
 
+# автодобавление включено только в одной вкладке, иначе непонятно, куда класть новый чат
 $AutoAddChk.Add_Click({
-        $state.AutoAdd = [bool]$AutoAddChk.IsChecked
-        Write-UiLog 'info' ('Автодобавление чатов: ' + $(if ($state.AutoAdd) { 'вкл' } else { 'выкл' }))
+        $tab = $script:ActiveTab
+        if ($null -eq $tab) { return }
+        $on = [bool]$AutoAddChk.IsChecked
+        $tab.AutoAdd = $on
+        if ($on) {
+            foreach ($t in @($state.Tabs)) {
+                if ([string]$t.Id -ne [string]$tab.Id -and [bool]$t.AutoAdd) {
+                    $t.AutoAdd = $false
+                    Write-UiLog 'info' ('Автодобавление перенесено из «' + [string]$t.Name + '» в «' + [string]$tab.Name + '»')
+                }
+            }
+        }
+        Write-UiLog 'info' ('Автодобавление чатов (' + [string]$tab.Name + '): ' + $(if ($on) { 'вкл' } else { 'выкл' }))
         Build-ChatRows
         $script:Dirty = $true
     })
@@ -2339,38 +2963,75 @@ $TopmostChk.Add_Click({
         $script:Dirty = $true
     })
 
+$TabNameBox.Add_TextChanged({
+        if ($script:LoadingTab) { return }
+        $tab = $script:ActiveTab
+        if ($null -eq $tab) { return }
+        $name = $TabNameBox.Text.Trim()
+        if (-not $name) { return }
+        $tab.Name = $name
+        $ui = $script:TabUi[[string]$tab.Id]
+        if ($ui) { $ui.Title.Text = $name }
+        Update-TabDot $tab
+        $script:Dirty = $true
+    })
+$TabNameBox.Add_LostFocus({
+        $tab = $script:ActiveTab
+        if ($null -ne $tab -and -not $TabNameBox.Text.Trim()) { $TabNameBox.Text = [string]$tab.Name }
+    })
+
+$NewTabBtn.Add_Click({ Add-Tab })
+$CloseTabBtn.Add_Click({ Close-Tab $script:ActiveTab })
+$TabScroll.Add_PreviewMouseWheel({
+        param($s, $e)
+        $TabScroll.ScrollToHorizontalOffset($TabScroll.HorizontalOffset - $e.Delta)
+        $e.Handled = $true
+    })
+
 $SettingsBtn.Add_Click({ Show-SettingsView ($SettingsView.Visibility -ne 'Visible') })
 $BackBtn.Add_Click({ Show-SettingsView $false })
-$window.Add_KeyDown({
+
+# Ctrl+T — новая вкладка, Ctrl+W — закрыть, Ctrl+Tab / Ctrl+Shift+Tab — переключение, Ctrl+1..9 — по номеру
+$window.Add_PreviewKeyDown({
         param($s, $e)
-        if ($e.Key -eq 'Escape' -and $SettingsView.Visibility -eq 'Visible') {
+        $key = [string]$e.Key
+        if ($key -eq 'Escape' -and $SettingsView.Visibility -eq 'Visible') {
             Show-SettingsView $false
             $e.Handled = $true
+            return
         }
+        $mods = [Windows.Input.Keyboard]::Modifiers
+        if (($mods -band [Windows.Input.ModifierKeys]::Control) -eq 0) { return }
+        $shift = (($mods -band [Windows.Input.ModifierKeys]::Shift) -ne 0)
+        if ($key -eq 'T') { Add-Tab; $e.Handled = $true }
+        elseif ($key -eq 'W') { Close-Tab $script:ActiveTab; $e.Handled = $true }
+        elseif ($key -eq 'Tab') { Step-Tab $(if ($shift) { -1 } else { 1 }); $e.Handled = $true }
+        elseif ($key -match '^D([1-9])$') { Select-TabNumber ([int]$Matches[1]); $e.Handled = $true }
     })
 
 $LimitNone.Add_Checked({ if ($LimitNone.IsChecked) { Set-LimitModeUi 'none' } })
 $LimitCountRadio.Add_Checked({ if ($LimitCountRadio.IsChecked) { Set-LimitModeUi 'count' } })
 $LimitTimeRadio.Add_Checked({ if ($LimitTimeRadio.IsChecked) { Set-LimitModeUi 'time' } })
 
-$CountBox.Add_TextChanged({
-        $n = Read-LimitCount
-        if ($n -gt 0) { $state.LimitCount = $n; $script:Dirty = $true; Update-LimitInputs; Update-Stats }
-    })
+$CountBox.Add_TextChanged({ Apply-CountFromUi; Update-Stats })
 $CountBox.Add_LostFocus({
+        $tab = $script:ActiveTab
+        if ($null -eq $tab) { return }
         $n = Read-LimitCount
-        if ($n -gt 0) { $state.LimitCount = $n; $CountBox.Text = [string]$n }
-        else { $CountBox.Text = [string]$state.LimitCount }
+        if ($n -gt 0) { $tab.LimitCount = $n; $CountBox.Text = [string]$n }
+        else { $CountBox.Text = [string]$tab.LimitCount }
         Update-LimitInputs
         $script:Dirty = $true
     })
 
-$TimeBox.Add_TextChanged({ Apply-LimitFromUi; Update-Stats })
+$TimeBox.Add_TextChanged({ Apply-TimeFromUi; Update-Stats })
 $TimeBox.Add_LostFocus({
+        $tab = $script:ActiveTab
+        if ($null -eq $tab) { return }
         $parsed = Parse-TimeText $TimeBox.Text
         if ($parsed) { $TimeBox.Text = $parsed.Text }
-        else { $TimeBox.Text = [string]$state.LimitTime }
-        Apply-LimitFromUi
+        else { $TimeBox.Text = [string]$tab.LimitTime }
+        Apply-TimeFromUi
         Update-Stats
     })
 
@@ -2384,6 +3045,8 @@ $TrayBtn.Add_Click({ $window.Hide() })
 $DataBtn.Add_Click({
         try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $script:AppDir + '"') } catch { }
     })
+
+$window.Add_SizeChanged({ Update-TabLayout })
 
 $window.Add_Loaded({
         $wa = [Windows.SystemParameters]::WorkArea
@@ -2402,10 +3065,13 @@ $window.Add_Loaded({
             [void][Native.Dwm]::DwmSetWindowAttribute($hwnd, 33, [ref]$round, 4)
         }
         catch { }
+
+        Update-TabLayout
     })
 
 $window.Add_Closed({
-        $state.Stop = $true
+        $state.Shutdown = $true
+        foreach ($t in @($state.Tabs)) { $t.Stop = $true }
         $timer.Stop()
 
         try {
@@ -2434,6 +3100,7 @@ $script:PulseAnimation.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]
 
 $script:TrayIcon = $null
 $script:TrayToggle = $null
+$script:LastTrayText = ''
 try {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -2458,7 +3125,7 @@ try {
 
     $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
     $trayShow = New-Object System.Windows.Forms.ToolStripMenuItem('Показать окно')
-    $script:TrayToggle = New-Object System.Windows.Forms.ToolStripMenuItem('Остановить')
+    $script:TrayToggle = New-Object System.Windows.Forms.ToolStripMenuItem('Остановить все')
     $trayExit = New-Object System.Windows.Forms.ToolStripMenuItem('Выход')
     [void]$trayMenu.Items.Add($trayShow)
     [void]$trayMenu.Items.Add($script:TrayToggle)
@@ -2466,7 +3133,7 @@ try {
     $trayIcon.ContextMenuStrip = $trayMenu
 
     $trayShow.Add_Click({ $window.Show(); $window.WindowState = 'Normal'; $window.Activate() })
-    $script:TrayToggle.Add_Click({ Toggle-Run })
+    $script:TrayToggle.Add_Click({ Toggle-All })
     $trayExit.Add_Click({ $window.Close() })
     $trayIcon.Add_DoubleClick({ $window.Show(); $window.WindowState = 'Normal'; $window.Activate() })
 
@@ -2475,6 +3142,8 @@ try {
 catch { }
 
 # ---- таймер интерфейса ----
+
+$script:LastAllSig = ''
 
 $timer = [Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromMilliseconds(220)
@@ -2491,24 +3160,55 @@ $timer.Add_Tick({
             foreach ($line in $lines) { Add-LogLine $line }
             if ($lines.Count -gt 0 -and $SettingsView.Visibility -eq 'Visible') { $LogBox.ScrollToEnd() }
 
-            $sigParts = @()
-            foreach ($chat in @($state.Chats)) {
-                $sigParts += ([string]$chat.Id + '|' + [string]$chat.Title)
+            # состояние каждой вкладки: цвет точки и уведомления о потере связи / лимите
+            $tabsNow = @($state.Tabs)
+            $errNames = @()
+            $limitNames = @()
+            foreach ($tab in $tabsNow) {
+                $key = Get-TabStatusKey $tab
+                if ($key -ne [string]$tab.UiKey) {
+                    $first = ([string]$tab.UiKey -eq '')
+                    $tab.UiKey = $key
+                    Update-TabDot $tab
+                    if (-not $first) {
+                        if ($key -eq 'error') { $errNames += [string]$tab.Name }
+                        elseif ($key -eq 'limit') { $limitNames += [string]$tab.Name }
+                    }
+                }
             }
-            $sig = $sigParts -join '~'
+            if ($errNames.Count -gt 0) {
+                Show-Balloon 'OpenCode AutoContinue' 'Нет связи с OpenCode. Автопродолжение приостановлено, переподключение в фоне.'
+            }
+            if ($limitNames.Count -gt 0) {
+                $msg = if ($tabsNow.Count -gt 1) { 'Лимит запуска достигнут: ' + ($limitNames -join ', ') } else { 'Лимит запуска достигнут — автопродолжение остановлено.' }
+                Show-Balloon 'OpenCode AutoContinue' $msg
+            }
+
+            # чаты могут появиться и в неактивных вкладках (автодобавление) — это тоже повод сохранить настройки
+            $allSig = ($tabsNow | ForEach-Object { Get-ChatSig $_ }) -join '|'
+            if ($allSig -ne $script:LastAllSig) { $script:LastAllSig = $allSig; $script:Dirty = $true }
+
+            $sig = Get-ChatSig $script:ActiveTab
             if ($sig -ne $script:LastSig) {
                 $script:LastSig = $sig
                 Build-ChatRows
-                $script:Dirty = $true
             }
             Update-ChatRows
-
-            $statusKey = if (-not [bool]$state.Stop) { 'running' } else { [string]$state.StopReason }
-            if ($statusKey -ne $script:LastStatusKey) {
-                $script:LastStatusKey = $statusKey
-                Update-StatusVisual
-            }
+            Update-StatusVisual
             Update-Stats
+
+            if ($script:TrayIcon) {
+                $running = @($tabsNow | Where-Object { -not $_.Stop }).Count
+                $trayText = if ($tabsNow.Count -le 1) {
+                    if ($running -gt 0) { 'AutoContinue — работает' } else { 'AutoContinue — пауза' }
+                }
+                else { 'AutoContinue — работает ' + $running + ' из ' + $tabsNow.Count }
+                if ($trayText -ne $script:LastTrayText) {
+                    $script:LastTrayText = $trayText
+                    $script:TrayIcon.Text = $trayText
+                    if ($script:TrayToggle) { $script:TrayToggle.Text = if ($running -gt 0) { 'Остановить все' } else { 'Запустить все' } }
+                }
+            }
 
             if ($script:Dirty) { Save-Settings }
         }
@@ -2519,33 +3219,38 @@ $timer.Add_Tick({
             catch { }
         }
     })
-$script:LastStatusKey = ''
 
 # ---- старт ----
 
-Set-LimitModeUi ([string]$state.LimitMode)
-if ([string]$state.LimitMode -eq 'time') {
-    $parsedTime = Parse-TimeText ([string]$state.LimitTime)
-    if ($parsedTime) {
-        $state.DeadlineTicks = (Get-NextDeadline $parsedTime.Hour $parsedTime.Minute).Ticks
-        $state.LimitSince = Get-Date
-    }
+foreach ($t in @($state.Tabs)) {
+    if ([string]$t.LimitMode -eq 'time') { Set-TabDeadline $t }
+    Add-TabItem $t
 }
-Update-LimitInputs
-Update-StatusVisual
-Update-Stats
-Build-ChatRows
-$script:LastSig = (@($state.Chats | ForEach-Object { [string]$_.Id + '|' + [string]$_.Title }) -join '~')
+$startTab = Find-TabById ([string]$settings.activeTab)
+if ($null -eq $startTab) { $startTab = @($state.Tabs)[0] }
+Select-Tab $startTab
+$script:LastAllSig = (@($state.Tabs | ForEach-Object { Get-ChatSig $_ }) -join '|')
 $script:Dirty = $false
 
-Write-UiLog 'info' ('Окно запущено · v' + $script:AppVersion + ' · интервал ' + $state.PollMs + ' мс')
+Write-UiLog 'info' ('Окно запущено · v' + $script:AppVersion + ' · вкладок: ' + @($state.Tabs).Count + ' · интервал ' + $state.PollMs + ' мс')
 $timer.Start()
+
+# страховка: необработанная ошибка в любом обработчике пишется в журнал и не закрывает окно
+try {
+    $window.Dispatcher.Add_UnhandledException({
+            param($s, $e)
+            try { [IO.File]::AppendAllText($script:LogFile, ((Get-Date).ToString('HH:mm:ss') + '  [x] Ошибка интерфейса: ' + $e.Exception.Message + "`r`n")) } catch { }
+            try { Write-UiLog 'err' ('Ошибка интерфейса: ' + $e.Exception.Message) } catch { }
+            $e.Handled = $true
+        })
+}
+catch { }
 
 [void]$window.ShowDialog()
 
 # ---------------------------------------------------------------- cleanup ----
 
-$state.Stop = $true
+$state.Shutdown = $true
 $timer.Stop()
 Start-Sleep -Milliseconds 300
 try {

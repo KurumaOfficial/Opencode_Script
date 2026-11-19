@@ -1,13 +1,32 @@
 {
-  "schema": 2,
-  "message": "Продолжай разработку",
-  "autoAdd": false,
-  "chats": [
-    { "id": "ses_xxxxxxxxxxxxxxxxxxxxxxxx", "title": "Название чата" }
+  "schema": 3,
+  "activeTab": "tab_a1b2c3d4",
+  "tabs": [
+    {
+      "id": "tab_a1b2c3d4",
+      "name": "Сайт",
+      "message": "Продолжай разработку",
+      "paused": false,
+      "autoAdd": false,
+      "limitMode": "count",
+      "limitCount": 50,
+      "limitTime": "18:00",
+      "chats": [
+        { "id": "ses_xxxxxxxxxxxxxxxxxxxxxxxx", "title": "Название чата" }
+      ]
+    },
+    {
+      "id": "tab_e5f6a7b8",
+      "name": "Бот",
+      "message": "Продолжай, проверь тесты",
+      "paused": true,
+      "autoAdd": false,
+      "limitMode": "none",
+      "limitCount": 50,
+      "limitTime": "18:00",
+      "chats": []
+    }
   ],
   "ignored": [],
-  "limitMode": "none",
-  "limitCount": 50,
-  "limitTime": "18:00",
   "topmost": true
 }

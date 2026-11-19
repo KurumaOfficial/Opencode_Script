@@ -33,6 +33,6 @@ Invoke-PS2EXE `
     -description 'Auto-continue OpenCode chats' `
     -product 'OpenCode AutoContinue' `
     -company 'KurumaOfficial' `
-    -version '1.4.0.0'
+    -version '1.5.0.0'
 
 Write-Host "Готово: $OutputPath"
