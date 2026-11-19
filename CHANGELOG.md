@@ -1,9 +1,26 @@
 # Changelog
 
-## Unreleased
+## 1.5.0
+
+### Added
+- Tabs. Each tab is an independent task with its own message, chats, run limit and start/stop state. Tabs are created with `+` or `Ctrl+T` and switched like in a browser (`Ctrl+Tab`, `Ctrl+1` to `Ctrl+9`, mouse wheel on the strip). Rename by double click, close with `x`, middle click or `Ctrl+W`. Up to 10 tabs.
+- A status dot on every tab: running, paused, limit reached, no connection.
+- Closing a tab that has chats asks for confirmation in a dialog that matches the window style.
+- Auto-add can be turned on for one tab at a time.
 
 ### Changed
+- A session belongs to one tab only. The chat picker hides sessions tracked in any tab, and the worker refuses duplicates.
+- New tabs start paused with an empty message; starting a tab with an empty message is refused with a log warning.
+- A lost connection or a rejected password pauses all running tabs together and resumes them together.
+- The tray menu has Stop all / Start all. The tray tooltip shows how many tabs are running.
+- The log shows the tab name next to the chat name when there is more than one tab. Long messages are shortened in the log.
+- Settings use format version 3. Files from 1.4 and earlier are migrated: the single task becomes the first tab.
+- Default window height is 540 (a row for the tabs was added); minimum height is 480.
 - License changed from MIT to GPL-3.0.
+
+### Fixed
+- After a pause, a chat that was waiting for a reply sat idle for 45 seconds before the next send. It now returns to waiting and is sent to right away if the assistant is idle. The same applies when a tab resumes after a connection loss.
+- The system message boxes in the chat picker are replaced with dialogs in the application style.
 
 ## 1.4.0
 
